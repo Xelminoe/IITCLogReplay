@@ -2,7 +2,7 @@
 // @id             iitc-plugin-trajectory-loader
 // @name           IITC plugin: Trajectory Loader
 // @category       Layer
-// @version        1.9.032
+// @version        1.9.033
 // @match          https://intel.ingress.com/*
 // @grant          none
 // @run-at         document-end
@@ -11,7 +11,7 @@
 (function wrapper(plugin_info) {
     if (typeof window.plugin !== 'function') window.plugin = function () {};
     plugin_info.pluginId = 'iitc-plugin-trajectory-loader';
-    plugin_info.dateTimeVersion = '2026101207';
+    plugin_info.dateTimeVersion = '2026101402';
     plugin_info.buildName = 'beta';
 
     window.IITC = window.IITC || {};
@@ -31,6 +31,7 @@
             players: {}      // { playerName: count } - optional pre-aggregation for next steps
         }
     });
+    if (!Object.prototype.hasOwnProperty.call(STORE, 'snapshot')) STORE.snapshot = null;
 
     // ---------- Colors / Player palette ----------
     const COLORS = (function() {
@@ -624,6 +625,166 @@
         });
     }
 
+    function canonicalPortalKey(portal) {
+        if (portal?.guid) return `g:${portal.guid}`;
+        const lat = Number(portal?.lat);
+        const lng = Number(portal?.lng);
+        return Number.isFinite(lat) && Number.isFinite(lng)
+            ? `c:${lat.toFixed(6)},${lng.toFixed(6)}`
+            : null;
+    }
+
+    function canonicalLinkKey(a, b) {
+        const left = canonicalPortalKey(a);
+        const right = canonicalPortalKey(b);
+        if (!left || !right) return null;
+        return left < right ? `${left}|${right}` : `${right}|${left}`;
+    }
+
+    function finiteTimestamp(...values) {
+        for (const value of values) {
+            if (value === null || value === undefined || value === '') continue;
+            const number = Number(value);
+            if (Number.isFinite(number)) return number;
+        }
+        return null;
+    }
+
+    function normalizeSnapshotFaction(value) {
+        if (typeof value === 'string') {
+            const faction = value.toUpperCase();
+            if (faction === 'RESISTANCE' || faction === 'R') return 'RESISTANCE';
+            if (faction === 'ENLIGHTENED' || faction === 'E') return 'ENLIGHTENED';
+            if (faction === 'MACHINA' || faction === 'M') return 'MACHINA';
+            if (faction === 'NEUTRAL' || faction === 'N') return 'NEUTRAL';
+        }
+        const teamId = Number(value);
+        if (teamId === 1) return 'RESISTANCE';
+        if (teamId === 2) return 'ENLIGHTENED';
+        if (teamId === 3) return 'MACHINA';
+        if (teamId === 0) return 'NEUTRAL';
+        return null;
+    }
+
+    function snapshotPoint(guid, latE6, lngE6, fallback = null) {
+        const lat = Number(latE6);
+        const lng = Number(lngE6);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            return { guid: guid || undefined, lat: lat / 1e6, lng: lng / 1e6 };
+        }
+        if (!fallback) return null;
+        const fallbackLat = Number(fallback.lat);
+        const fallbackLng = Number(fallback.lng);
+        if (!Number.isFinite(fallbackLat) || !Number.isFinite(fallbackLng)) return null;
+        return { guid: guid || fallback.guid || undefined, lat: fallbackLat, lng: fallbackLng };
+    }
+
+    function collectSnapshotGeometry(value, result = []) {
+        if (Array.isArray(value)) {
+            for (const item of value) collectSnapshotGeometry(item, result);
+        } else if (value && typeof value === 'object') {
+            const lat = Number(value.lat);
+            const lng = Number(value.lng);
+            if (Number.isFinite(lat) && Number.isFinite(lng)) result.push({ lat, lng });
+        }
+        return result;
+    }
+
+    function loadSnapshotObject(parsed, metadata = {}) {
+        if (!parsed || parsed.format !== 'iitc-map-snapshot' || !Array.isArray(parsed.links)) {
+            throw new Error('Expected an IITC Snapshot Exporter JSON file');
+        }
+        const capturedAtMs = finiteTimestamp(parsed.capturedAtMs, Date.parse(parsed.capturedAt || ''));
+        if (capturedAtMs === null) throw new Error('Snapshot has no valid capture time');
+
+        const portalPositions = new Map();
+        for (const portal of Array.isArray(parsed.portals) ? parsed.portals : []) {
+            const data = portal?.data || {};
+            const guid = String(portal?.guid ?? data.guid ?? '');
+            if (!guid) continue;
+            const point = snapshotPoint(guid, data.latE6, data.lngE6, portal.position);
+            if (point) portalPositions.set(guid, point);
+        }
+
+        const byKey = new Map();
+        let skippedLinks = 0;
+        let duplicateLinks = 0;
+        for (const link of parsed.links) {
+            const data = link?.data || {};
+            const raw = Array.isArray(link?.rawEntity) ? link.rawEntity : null;
+            const rawData = Array.isArray(raw?.[2]) ? raw[2] : null;
+            const originGuid = data.oGuid ?? rawData?.[2] ?? null;
+            const destinationGuid = data.dGuid ?? rawData?.[5] ?? null;
+            const geometry = collectSnapshotGeometry(link?.geometry);
+            const origin = snapshotPoint(
+                originGuid,
+                data.oLatE6 ?? rawData?.[3],
+                data.oLngE6 ?? rawData?.[4],
+                portalPositions.get(String(originGuid)) || geometry[0]
+            );
+            const destination = snapshotPoint(
+                destinationGuid,
+                data.dLatE6 ?? rawData?.[6],
+                data.dLngE6 ?? rawData?.[7],
+                portalPositions.get(String(destinationGuid)) || geometry[1]
+            );
+            const key = canonicalLinkKey(origin, destination);
+            if (!origin || !destination || !key) {
+                skippedLinks += 1;
+                continue;
+            }
+            const normalized = {
+                key,
+                guid: String(link?.guid ?? data.guid ?? raw?.[0] ?? ''),
+                a: origin,
+                b: destination,
+                timestamp: finiteTimestamp(link?.timestamp, data.timestamp, raw?.[1]),
+                capturedAtMs,
+                faction: normalizeSnapshotFaction(data.team ?? link?.team ?? rawData?.[1]),
+                source: 'snapshot'
+            };
+            const previous = byKey.get(key);
+            if (previous) {
+                duplicateLinks += 1;
+                if ((normalized.timestamp ?? -Infinity) < (previous.timestamp ?? -Infinity)) continue;
+            }
+            byKey.set(key, normalized);
+        }
+
+        STORE.snapshot = {
+            name: String(metadata.name || 'snapshot.json'),
+            size: Number(metadata.size) || 0,
+            loadedAt: Date.now(),
+            capturedAtMs,
+            capturedAt: parsed.capturedAt || new Date(capturedAtMs).toISOString(),
+            sourceCounts: {
+                portals: Array.isArray(parsed.portals) ? parsed.portals.length : 0,
+                links: parsed.links.length,
+                fields: Array.isArray(parsed.fields) ? parsed.fields.length : 0
+            },
+            links: Array.from(byKey.values()),
+            skippedLinks,
+            duplicateLinks
+        };
+        return STORE.snapshot;
+    }
+
+    async function loadSnapshotFile(file) {
+        let parsed;
+        try {
+            parsed = JSON.parse(await readFileAsText(file));
+        } catch (error) {
+            throw new Error(`Invalid snapshot JSON: ${error?.message || error}`);
+        }
+        return loadSnapshotObject(parsed, { name: file.name, size: file.size });
+    }
+
+    const SNAPSHOT = (PLUGIN_NS.snapshot = PLUGIN_NS.snapshot || {});
+    SNAPSHOT.loadObject = loadSnapshotObject;
+    SNAPSHOT.loadFile = loadSnapshotFile;
+    SNAPSHOT.clear = () => { STORE.snapshot = null; };
+    Object.defineProperty(SNAPSHOT, 'current', { configurable: true, get: () => STORE.snapshot });
+
     async function loadAndMerge(files, progressCb) {
         const summaries = [];
         const allMessages = [];
@@ -885,6 +1046,150 @@
         trajMinWeightSum: 0.5          // 加权窗口里总权重低于该值则退回原始锚点
 
     };
+
+    const LINK_LIFECYCLES = (function () {
+        function build(startTs, endTs, options = {}) {
+            const selectedSet = options.selectedSet instanceof Set ? options.selectedSet : null;
+            const source = (Array.isArray(options.events) ? options.events : (STORE.events || []))
+                .slice()
+                .sort((a, b) => a.ts - b.ts);
+            const result = [];
+            const byKey = new Map();
+            const open = new Map();
+            const eventTimes = new Map();
+
+            function addRecord(record) {
+                result.push(record);
+                let bucket = byKey.get(record.key);
+                if (!bucket) byKey.set(record.key, bucket = []);
+                bucket.push(record);
+                return record;
+            }
+
+            for (const ev of source) {
+                if ((ev.type !== 'link' && ev.type !== 'link_destroyed') || ev.portals?.length < 2) continue;
+                const a = ev.portals[0];
+                const b = ev.portals[1];
+                const key = canonicalLinkKey(a, b);
+                if (!key) continue;
+                let times = eventTimes.get(key);
+                if (!times) eventTimes.set(key, times = []);
+                times.push(ev.ts);
+
+                if (ev.type === 'link') {
+                    const previous = open.get(key);
+                    if (previous) previous.deadTs = Math.max(previous.bornTs + 1, ev.ts);
+                    const record = addRecord({
+                        key, a, b,
+                        bornTs: ev.ts,
+                        deadTs: Infinity,
+                        faction: ev.faction || null,
+                        createdBy: ev.player || null,
+                        destroyedBy: null,
+                        fromSnapshot: false,
+                        snapshotGuid: null,
+                        inferenceConflict: false
+                    });
+                    open.set(key, record);
+                } else {
+                    const record = open.get(key);
+                    if (record) {
+                        record.deadTs = Math.max(record.bornTs + 1, ev.ts);
+                        record.destroyedBy = ev.player || null;
+                        if (!record.faction && ev.faction) record.faction = ev.faction;
+                        open.delete(key);
+                    } else {
+                        addRecord({
+                            key, a, b,
+                            bornTs: startTs,
+                            deadTs: ev.ts,
+                            faction: ev.faction || null,
+                            createdBy: null,
+                            destroyedBy: ev.player || null,
+                            fromSnapshot: false,
+                            snapshotGuid: null,
+                            inferenceConflict: false
+                        });
+                    }
+                }
+            }
+
+            let supplemented = 0;
+            let matched = 0;
+            let conflicts = 0;
+            if (options.includeSnapshot !== false && STORE.snapshot?.links?.length) {
+                for (const snapshotLink of STORE.snapshot.links) {
+                    const key = snapshotLink.key || canonicalLinkKey(snapshotLink.a, snapshotLink.b);
+                    if (!key) continue;
+                    const capturedAt = finiteTimestamp(snapshotLink.capturedAtMs, STORE.snapshot.capturedAtMs);
+                    if (capturedAt === null) continue;
+                    const candidates = byKey.get(key) || [];
+                    let observed = candidates.find(record =>
+                        record.bornTs <= capturedAt && capturedAt < record.deadTs
+                    );
+                    if (observed) {
+                        observed.fromSnapshot = true;
+                        observed.snapshotGuid = snapshotLink.guid || null;
+                        if (!observed.faction) observed.faction = snapshotLink.faction || null;
+                        matched += 1;
+                        continue;
+                    }
+
+                    let bornTs = finiteTimestamp(snapshotLink.timestamp);
+                    if (bornTs === null) bornTs = startTs;
+                    let latestDeath = -Infinity;
+                    for (const record of candidates) {
+                        if (record.deadTs <= capturedAt) latestDeath = Math.max(latestDeath, record.deadTs);
+                    }
+                    let inferenceConflict = false;
+                    if (bornTs > capturedAt || bornTs <= latestDeath) {
+                        bornTs = capturedAt;
+                        inferenceConflict = true;
+                        conflicts += 1;
+                    }
+                    const nextBoundary = (eventTimes.get(key) || []).find(ts => ts > capturedAt) ?? Infinity;
+                    addRecord({
+                        key,
+                        a: snapshotLink.a,
+                        b: snapshotLink.b,
+                        bornTs,
+                        deadTs: nextBoundary,
+                        faction: snapshotLink.faction || null,
+                        createdBy: null,
+                        destroyedBy: null,
+                        fromSnapshot: true,
+                        snapshotGuid: snapshotLink.guid || null,
+                        inferenceConflict
+                    });
+                    supplemented += 1;
+                }
+            }
+
+            const visible = result
+                .filter(record => record.bornTs <= endTs && record.deadTs > startTs)
+                .filter(record => !selectedSet || record.fromSnapshot ||
+                    selectedSet.has(record.createdBy) || selectedSet.has(record.destroyedBy))
+                .sort((left, right) => left.key.localeCompare(right.key) || left.bornTs - right.bornTs)
+                .map((record, index) => ({
+                    ...record,
+                    id: `${record.key}#${index + 1}`,
+                    deadTs: Number.isFinite(record.deadTs) ? record.deadTs : endTs + 1
+                }));
+
+            if (STORE.snapshot) {
+                STORE.snapshot.lastMergeStats = {
+                    supplemented,
+                    matched,
+                    conflicts,
+                    visible: visible.filter(record => record.fromSnapshot).length
+                };
+            }
+            return visible;
+        }
+
+        return { build };
+    })();
+    PLUGIN_NS.linkLifecycles = LINK_LIFECYCLES;
 
     // ─────────────────────────────────────────────────────────────
     // Virtual Clock (single source of time)
@@ -1269,58 +1574,8 @@
             }
         }
 
-        function portalKey(p) {
-            return p?.guid ? `g:${p.guid}` : `c:${Number(p?.lat || 0).toFixed(6)},${Number(p?.lng || 0).toFixed(6)}`;
-        }
-
-        function linkKey(a, b) {
-            const ka = portalKey(a), kb = portalKey(b);
-            return ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
-        }
-
         function buildLinkLifecycles(startTs, endTs, selectedSet) {
-            const result = [];
-            const open = new Map();
-            const source = (STORE.events || []).slice().sort((a, b) => a.ts - b.ts);
-            for (const ev of source) {
-                if ((ev.type !== 'link' && ev.type !== 'link_destroyed') || ev.portals?.length < 2) continue;
-                const a = ev.portals[0], b = ev.portals[1];
-                const key = linkKey(a, b);
-                if (ev.type === 'link') {
-                    const old = open.get(key);
-                    if (old) old.deadTs = Math.max(old.bornTs + 1, ev.ts);
-                    const rec = {
-                        a, b,
-                        bornTs: ev.ts,
-                        deadTs: endTs + 1,
-                        faction: ev.faction || null,
-                        createdBy: ev.player || null,
-                        destroyedBy: null
-                    };
-                    result.push(rec);
-                    open.set(key, rec);
-                } else {
-                    const rec = open.get(key);
-                    if (rec) {
-                        rec.deadTs = Math.max(rec.bornTs + 1, ev.ts);
-                        rec.destroyedBy = ev.player || null;
-                        if (!rec.faction && ev.faction) rec.faction = ev.faction;
-                        open.delete(key);
-                    } else {
-                        result.push({
-                            a, b,
-                            bornTs: startTs,
-                            deadTs: ev.ts,
-                            faction: ev.faction || null,
-                            createdBy: null,
-                            destroyedBy: ev.player || null
-                        });
-                    }
-                }
-            }
-            return result.filter(rec =>
-                selectedSet.has(rec.createdBy) || selectedSet.has(rec.destroyedBy)
-            );
+            return LINK_LIFECYCLES.build(startTs, endTs, { selectedSet });
         }
 
         function makeProjection(points, width, height) {
@@ -1669,6 +1924,10 @@
             const points = selectedEvents
                 .filter(ev => timeWindows.some(window => ev.ts >= window.startTs && ev.ts <= window.endTs))
                 .map(getEventAnchor);
+            for (const link of links) {
+                if (!link.fromSnapshot) continue;
+                points.push(link.a, link.b);
+            }
             if (!points.length) {
                 for (const ev of selectedEvents) points.push(getEventAnchor(ev));
             }
@@ -1999,6 +2258,8 @@
                     usesMapViewport: result.usesMapViewport,
                     layers: { ...model.layerOptions },
                     portalCount: model.backgroundPortals.length,
+                    linkCount: model.links.length,
+                    snapshotLinkCount: model.links.filter(link => link.fromSnapshot).length,
                     mapTileCount: model.mapTileCount || 0,
                     mapTileFailures: model.mapTileFailures || 0,
                     timeWindows: model.timeWindows.map(window => ({ ...window })),
@@ -2022,7 +2283,7 @@
             // Kept deliberately small: useful for regression tests without Canvas/IITC.
             _test: {
                 ByteWriter, GifEncoder, makePalette, writeSubblockedLzw,
-                normalizeTimeWindows, buildFrameSchedule
+                normalizeTimeWindows, buildFrameSchedule, buildLinkLifecycles
             }
         };
     })();
@@ -2246,19 +2507,6 @@
                 } catch (e) {}
             }
         }
-
-        function _canonPortalKey(p) {
-            return p?.guid ? `g:${p.guid}` : `c:${(p.lat||0).toFixed(6)},${(p.lng||0).toFixed(6)}`;
-        }
-        function _linkKey(p1, p2) {
-            const k1 = _canonPortalKey(p1), k2 = _canonPortalKey(p2);
-            return (k1 < k2) ? (k1 + '|' + k2) : (k2 + '|' + k1);
-        }
-        function _resolveTeamColorByFaction(faction) {
-            const map = (RENDER.config?.colorByTeam) || {};
-            return map[faction] || '#888888';
-        }
-
 
         // 事件唯一标识：ts + player + 首门户 guid/坐标 + type
         function eventId(ev) {
@@ -2702,65 +2950,15 @@
                 const linkSource = (RENDER.config.linksFromAll ? (STORE.events || []) : state.events)
                     .slice()
                     .sort((a, b) => a.ts - b.ts);
-                const openLinks = new Map();
-                const cycleCounts = new Map();
-
-                for (const ev of linkSource) {
-                    if (ev.type !== 'link' && ev.type !== 'link_destroyed') continue;
-                    if (!Array.isArray(ev.portals) || ev.portals.length < 2) continue;
-                    const a = ev.portals[0], b = ev.portals[1];
-                    const baseKey = _linkKey(a, b);
-
-                    if (ev.type === 'link') {
-                        // A new creation starts a new lifecycle. If the previous
-                        // lifecycle has no observed destruction, close it here.
-                        const previous = openLinks.get(baseKey);
-                        if (previous) previous.deadTs = Math.max(previous.bornTs + 1, ev.ts);
-
-                        const cycle = (cycleCounts.get(baseKey) || 0) + 1;
-                        cycleCounts.set(baseKey, cycle);
-                        const rec = {
-                            a, b,
-                            faction: ev.faction || null,
-                            createdBy: ev.player || null,
-                            destroyedBy: null,
-                            bornTs: ev.ts,
-                            deadTs: null,
-                            poly: null,
-                            removing: false,
-                            timer: null
-                        };
-                        state.links.set(`${baseKey}#${cycle}`, rec);
-                        openLinks.set(baseKey, rec);
-                    } else if (ev.type === 'link_destroyed') {
-                        const rec = openLinks.get(baseKey);
-                        if (rec) {
-                            rec.deadTs = Math.max(rec.bornTs + 1, ev.ts);
-                            rec.destroyedBy = ev.player || null;
-                            if (!rec.faction && ev.faction) rec.faction = ev.faction;
-                            openLinks.delete(baseKey);
-                        } else {
-                            // Destruction without a creation in the loaded range:
-                            // represent the link as existing from the range start.
-                            const cycle = (cycleCounts.get(baseKey) || 0) + 1;
-                            cycleCounts.set(baseKey, cycle);
-                            state.links.set(`${baseKey}#${cycle}`, {
-                                a, b,
-                                faction: ev.faction || null,
-                                createdBy: null,
-                                destroyedBy: ev.player || null,
-                                bornTs: startBound,
-                                deadTs: ev.ts,
-                                poly: null,
-                                removing: false,
-                                timer: null
-                            });
-                        }
-                    }
+                const lifecycles = LINK_LIFECYCLES.build(startBound, endBound, { events: linkSource });
+                for (const lifecycle of lifecycles) {
+                    state.links.set(lifecycle.id, {
+                        ...lifecycle,
+                        poly: null,
+                        removing: false,
+                        timer: null
+                    });
                 }
-
-                // Open links remain visible through the final clock instant.
-                for (const rec of openLinks.values()) rec.deadTs = endBound + 1;
 
                 // rebuild per-player indices for attack direction inference
                 state.perPlayer.clear();
@@ -3366,6 +3564,49 @@
         fileRow.appendChild(btnLoadInline);
         fileSection.appendChild(fileRow);
 
+        const snapshotRow = document.createElement('div');
+        snapshotRow.style.display = 'flex';
+        snapshotRow.style.flexDirection = 'column';
+        snapshotRow.style.alignItems = 'flex-start';
+        snapshotRow.style.gap = '6px';
+        snapshotRow.style.marginTop = '10px';
+
+        const snapshotLabel = document.createElement('div');
+        snapshotLabel.textContent = 'Link snapshot (optional)';
+        snapshotLabel.style.fontSize = '12px';
+
+        const snapshotInput = document.createElement('input');
+        snapshotInput.type = 'file';
+        snapshotInput.accept = 'application/json';
+        snapshotInput.style.width = '100%';
+        snapshotInput.style.maxWidth = '100%';
+        snapshotInput.style.minWidth = '0';
+        snapshotInput.style.boxSizing = 'border-box';
+
+        const snapshotActions = document.createElement('div');
+        snapshotActions.style.display = 'flex';
+        snapshotActions.style.flexWrap = 'wrap';
+        snapshotActions.style.gap = '6px';
+        const btnLoadSnapshot = document.createElement('button');
+        btnLoadSnapshot.textContent = 'Load Snapshot';
+        btnLoadSnapshot.style.height = '28px';
+        const btnClearSnapshot = document.createElement('button');
+        btnClearSnapshot.textContent = 'Remove Snapshot';
+        btnClearSnapshot.style.height = '28px';
+        btnClearSnapshot.style.display = STORE.snapshot ? '' : 'none';
+        snapshotActions.appendChild(btnLoadSnapshot);
+        snapshotActions.appendChild(btnClearSnapshot);
+
+        const snapshotSummary = document.createElement('div');
+        snapshotSummary.style.fontSize = '12px';
+        snapshotSummary.style.opacity = '0.9';
+        snapshotSummary.style.overflowWrap = 'anywhere';
+        snapshotRow.appendChild(snapshotLabel);
+        snapshotRow.appendChild(snapshotInput);
+        snapshotRow.appendChild(snapshotActions);
+        snapshotRow.appendChild(snapshotSummary);
+        fileSection.appendChild(snapshotRow);
+
 
         // ─────────────────────────────────────────────────────────────
         // Section 2: Players & Colors (multi-select + per-player color)
@@ -3518,6 +3759,54 @@
             summary.textContent = `${STORE.stats.fileCount} ${fileWord} · ${spatialEvents ?? 0} events · ${playersTotal} players · ${formatTs(timeStart)} – ${formatTs(timeEnd)}`;
         }
 
+        function setSnapshotSummary(error = null) {
+            if (error) {
+                snapshotSummary.textContent = `Snapshot failed: ${error}`;
+                return;
+            }
+            const snapshot = STORE.snapshot;
+            btnClearSnapshot.style.display = snapshot ? '' : 'none';
+            if (!snapshot) {
+                snapshotSummary.textContent = '';
+                return;
+            }
+            const skipped = snapshot.skippedLinks ? ` · ${snapshot.skippedLinks} skipped` : '';
+            const duplicates = snapshot.duplicateLinks ? ` · ${snapshot.duplicateLinks} duplicate endpoints` : '';
+            const merge = snapshot.lastMergeStats;
+            const merged = merge
+                ? ` · ${merge.visible} active snapshot links${merge.conflicts ? ` · ${merge.conflicts} conflicts` : ''}`
+                : '';
+            snapshotSummary.textContent = `${snapshot.name} · ${formatTs(snapshot.capturedAtMs)} · ` +
+                `${snapshot.links.length}/${snapshot.sourceCounts.links} links${skipped}${duplicates}${merged}`;
+        }
+        setSnapshotSummary();
+
+        btnLoadSnapshot.onclick = async () => {
+            const file = snapshotInput.files?.[0];
+            if (!file) {
+                setSnapshotSummary('Choose a snapshot JSON file.');
+                return;
+            }
+            btnLoadSnapshot.disabled = true;
+            snapshotSummary.textContent = 'Loading snapshot…';
+            try {
+                await loadSnapshotFile(file);
+                if (RENDER.state.activeEvents?.length) btnRender.click();
+                setSnapshotSummary();
+            } catch (error) {
+                setSnapshotSummary(error?.message || error);
+            } finally {
+                btnLoadSnapshot.disabled = false;
+            }
+        };
+
+        btnClearSnapshot.onclick = () => {
+            SNAPSHOT.clear();
+            snapshotInput.value = '';
+            if (RENDER.state.activeEvents?.length) btnRender.click();
+            setSnapshotSummary();
+        };
+
         // Wire up inline loader
         btnLoadInline.onclick = async () => {
             const files = Array.from(fileInput.files || []);
@@ -3597,6 +3886,7 @@
             if (RENDER && RENDER.player && RENDER.player.updateUI) RENDER.player.updateUI();
             resetGifWindows();
             drawActivityTimeline(selected);
+            setSnapshotSummary();
         };
 
         const btnClear = document.createElement('button');
