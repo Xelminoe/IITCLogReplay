@@ -2,7 +2,7 @@
 // @id             iitc-plugin-trajectory-loader
 // @name           IITC plugin: Trajectory Loader
 // @category       Layer
-// @version        1.9.033
+// @version        1.9.035
 // @match          https://intel.ingress.com/*
 // @grant          none
 // @run-at         document-end
@@ -11,7 +11,7 @@
 (function wrapper(plugin_info) {
     if (typeof window.plugin !== 'function') window.plugin = function () {};
     plugin_info.pluginId = 'iitc-plugin-trajectory-loader';
-    plugin_info.dateTimeVersion = '2026101402';
+    plugin_info.dateTimeVersion = '2026101404';
     plugin_info.buildName = 'beta';
 
     window.IITC = window.IITC || {};
@@ -1135,8 +1135,13 @@
                         continue;
                     }
 
-                    let bornTs = finiteTimestamp(snapshotLink.timestamp);
-                    if (bornTs === null) bornTs = startTs;
+                    // IITC link entity timestamps are not reliable creation
+                    // times: field/tile updates can stamp an older baseline
+                    // link with the time a later triangle was completed. A
+                    // snapshot-only link is therefore initial state and starts
+                    // at the replay boundary. Explicit COMM events still split
+                    // or close its lifecycle below.
+                    let bornTs = startTs;
                     let latestDeath = -Infinity;
                     for (const record of candidates) {
                         if (record.deadTs <= capturedAt) latestDeath = Math.max(latestDeath, record.deadTs);
@@ -2155,13 +2160,14 @@
             const schedule = buildFrameSchedule(model.timeWindows, requestedFrameCount);
             const frameCount = schedule.length;
             const delayCs = Math.max(2, Math.round(100 / options.fps));
+            const endHoldCs = Math.round(options.endHoldSeconds * 100);
 
             for (let i = 0; i < frameCount; i++) {
                 if (token !== state.token) throw new DOMException('GIF export cancelled', 'AbortError');
                 const frame = schedule[i];
                 drawFrame(ctx, model, project, frame.ts, geometry.width, geometry.height, frame.frameStepMs, background.canvas, frame.windowIndex);
                 const rgba = ctx.getImageData(0, 0, geometry.width, geometry.height).data;
-                encoder.addFrame(palette.quantize(rgba), delayCs);
+                encoder.addFrame(palette.quantize(rgba), delayCs + (i === frameCount - 1 ? endHoldCs : 0));
                 if (i % 2 === 0 || i === frameCount - 1) {
                     onProgress?.({
                         fraction: (i + 1) / frameCount,
@@ -2183,12 +2189,13 @@
             const size = Math.max(384, Math.min(1920, Number(options.size) || 720));
             const fps = Math.max(3, Math.min(12, Number(options.fps) || 8));
             const duration = Math.max(5, Math.min(30, Number(options.duration) || 15));
+            const endHoldSeconds = Math.max(1, Math.min(5, Math.round(Number(options.endHoldSeconds) || 3)));
             const raw = [
-                { size: Math.round(size), fps: Math.round(fps), duration, paletteMode: 'balanced' },
-                { size: Math.max(480, Math.round(size * 0.83)), fps: Math.max(4, Math.round(fps * 0.75)), duration, paletteMode: 'compact' },
-                { size: Math.max(400, Math.round(size * 0.67)), fps: Math.max(3, Math.round(fps * 0.55)), duration, paletteMode: 'compact' },
-                { size: Math.max(400, Math.min(720, Math.round(size * 0.5))), fps: Math.max(3, Math.round(fps * 0.5)), duration: Math.min(duration, 15), paletteMode: 'compact' },
-                { size: 384, fps: 3, duration: Math.min(duration, 12), paletteMode: 'compact' }
+                { size: Math.round(size), fps: Math.round(fps), duration, endHoldSeconds, paletteMode: 'balanced' },
+                { size: Math.max(480, Math.round(size * 0.83)), fps: Math.max(4, Math.round(fps * 0.75)), duration, endHoldSeconds, paletteMode: 'compact' },
+                { size: Math.max(400, Math.round(size * 0.67)), fps: Math.max(3, Math.round(fps * 0.55)), duration, endHoldSeconds, paletteMode: 'compact' },
+                { size: Math.max(400, Math.min(720, Math.round(size * 0.5))), fps: Math.max(3, Math.round(fps * 0.5)), duration: Math.min(duration, 15), endHoldSeconds, paletteMode: 'compact' },
+                { size: 384, fps: 3, duration: Math.min(duration, 12), endHoldSeconds, paletteMode: 'compact' }
             ];
             const seen = new Set();
             return raw.filter(item => {
@@ -2254,6 +2261,8 @@
                     height: result.height,
                     fps: result.options.fps,
                     duration: result.options.duration,
+                    endHoldSeconds: result.options.endHoldSeconds,
+                    totalDuration: result.options.duration + result.options.endHoldSeconds,
                     paletteColors: result.paletteColors,
                     usesMapViewport: result.usesMapViewport,
                     layers: { ...model.layerOptions },
@@ -4419,6 +4428,7 @@
         const gifSize = addGifSelect('Size', [[1920, '1080p'], [720, '720 px'], [640, '640 px'], [512, '512 px']], 720);
         const gifFps = addGifSelect('FPS', [[8, '8'], [6, '6'], [4, '4']], 8);
         const gifDuration = addGifSelect('Duration', [[10, '10 s'], [15, '15 s'], [20, '20 s']], 15);
+        const gifEndHold = addGifSelect('End hold', [[1, '1 s'], [2, '2 s'], [3, '3 s'], [4, '4 s'], [5, '5 s']], 3);
         const gifOptionsBreak = document.createElement('div');
         gifOptionsBreak.style.flexBasis = '100%';
         gifOptionsBreak.style.height = '0';
@@ -4465,7 +4475,7 @@
             btnGif.disabled = true;
             btnGifCancel.disabled = false;
             btnGifCancel.style.display = '';
-            const gifControls = [gifSize, gifFps, gifDuration, gifMap, gifGrid, gifPortals, gifScale];
+            const gifControls = [gifSize, gifFps, gifDuration, gifEndHold, gifMap, gifGrid, gifPortals, gifScale];
             gifControls.forEach(control => { control.disabled = true; });
             try {
                 const result = await RENDER.gif.export({
@@ -4473,6 +4483,7 @@
                     size: Number(gifSize.value),
                     fps: Number(gifFps.value),
                     duration: Number(gifDuration.value),
+                    endHoldSeconds: Number(gifEndHold.value),
                     showMap: gifMap.checked,
                     showGrid: gifGrid.checked,
                     showPortals: gifPortals.checked,
@@ -4488,7 +4499,7 @@
                 });
                 const mb = result.byteLength / 1048576;
                 const windowInfo = gifWindows.length ? ` · ${result.timeWindows.length} windows` : '';
-                gifStatus.textContent = `Saved ${result.filename} · ${mb.toFixed(2)} MB · ${result.width}×${result.height} · ${result.frameCount} frames${windowInfo}${result.withinTarget ? '' : ' · above 9.5 MB'}`;
+                gifStatus.textContent = `Saved ${result.filename} · ${mb.toFixed(2)} MB · ${result.width}×${result.height} · ${result.frameCount} frames · ${result.endHoldSeconds}s hold${windowInfo}${result.withinTarget ? '' : ' · above 9.5 MB'}`;
             } catch (error) {
                 gifStatus.textContent = error?.name === 'AbortError'
                     ? 'GIF export cancelled.'
