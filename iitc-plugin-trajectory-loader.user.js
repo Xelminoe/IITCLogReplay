@@ -2,7 +2,7 @@
 // @id             iitc-plugin-trajectory-loader
 // @name           IITC plugin: Trajectory Loader
 // @category       Layer
-// @version        1.9.035
+// @version        2.0.001
 // @match          https://intel.ingress.com/*
 // @grant          none
 // @run-at         document-end
@@ -11,7 +11,7 @@
 (function wrapper(plugin_info) {
     if (typeof window.plugin !== 'function') window.plugin = function () {};
     plugin_info.pluginId = 'iitc-plugin-trajectory-loader';
-    plugin_info.dateTimeVersion = '2026101404';
+    plugin_info.dateTimeVersion = '2026101502';
     plugin_info.buildName = 'beta';
 
     window.IITC = window.IITC || {};
@@ -497,39 +497,6 @@
         const map = (RENDER.config && RENDER.config.trajWeightsByType) || {};
         const w = map[type];
         return (typeof w === 'number' && isFinite(w)) ? w : 0.0;
-    }
-
-    // Compute weighted centroid of a player's events within [ts - win, ts + win].
-    // Uses getEventAnchor(ev) as the spatial point. Returns {lat,lng} or null.
-    function weightedCentroidForPlayerAtTs(playerName, ts) {
-        const win = RENDER.config.trajSmoothWindowMs || 180000; // 3 min default
-        const t0 = ts - win, t1 = ts + win;
-
-        const all = Array.isArray(STORE.events) ? STORE.events : [];
-        let sumW = 0, sumLat = 0, sumLng = 0;
-
-        // NOTE: events 已按时间升序（参见 loadAndMerge 的构建）【:contentReference[oaicite:5]{index=5}】
-        // 可用简单线性扫描；如需更快可用 STORE.timeline.lowerBound/upperBound 做切片。
-        for (let i = 0; i < all.length; i++) {
-            const ev = all[i];
-            if (!ev || ev.player !== playerName) continue;
-            const t = ev.ts;
-            if (t < t0) continue;
-            if (t > t1) break;
-
-            const anchor = getEventAnchor(ev);
-            if (!anchor) continue;
-
-            const w = _weightOfEventType(ev.type);
-            if (w <= 0) continue;
-
-            sumW += w;
-            sumLat += w * anchor.lat;
-            sumLng += w * anchor.lng;
-        }
-
-        if (sumW < (RENDER.config.trajMinWeightSum || 0.5)) return null;
-        return { lat: sumLat / sumW, lng: sumLng / sumW };
     }
 
     // ---- Arrow helpers ----
@@ -1043,9 +1010,293 @@
             link: 1.0,
             destroy_reso: 0.15           // 明显小于其它事件
         },
-        trajMinWeightSum: 0.5          // 加权窗口里总权重低于该值则退回原始锚点
+        trajMinWeightSum: 0.5,         // 加权窗口里总权重低于该值则退回原始锚点
+        interactionRadiusByType: {
+            capture: 40,
+            deploy: 40,
+            link: 40
+        },
+        destroyPortalRadiusM: 40,      // resonators may be deployed this far from the portal
+        destroyWeaponRangeM: 168,      // conservative maximum XMP distance to a resonator
+        destroyFalloffStrength: 0.35,  // nonlinear inward prior; not an exact damage formula
+        interactionProjectionSteps: 16,
+        trajContinuityWeight: 0.03,    // weak distance preference only; no turn/curvature penalty
+        trajContinuityPasses: 2
 
     };
+
+    // One shared inferred-position model for map tracks and GIF player markers.
+    // Every node is an observed action time with a spatial estimate; positions
+    // between nodes are linearly interpolated on the real timeline.
+    const POSITION_MODEL = (function () {
+        const evidenceTypes = new Set(['capture', 'deploy', 'link', 'destroy_reso']);
+        let cachedEvents = null;
+        let cachedConfigKey = '';
+        let cachedSeries = new Map();
+
+        function configKey() {
+            const weights = RENDER.config.trajWeightsByType || {};
+            const radii = RENDER.config.interactionRadiusByType || {};
+            return JSON.stringify([
+                RENDER.config.trajUseWeightedNodes !== false,
+                Number(RENDER.config.trajSmoothWindowMs) || 0,
+                Number(RENDER.config.trajMinWeightSum) || 0,
+                ...Array.from(evidenceTypes).map(type => Number(weights[type]) || 0),
+                Number(radii.capture) || 0,
+                Number(radii.deploy) || 0,
+                Number(radii.link) || 0,
+                Number(RENDER.config.destroyPortalRadiusM) || 0,
+                Number(RENDER.config.destroyWeaponRangeM) || 0,
+                Number(RENDER.config.destroyFalloffStrength) || 0,
+                Number(RENDER.config.interactionProjectionSteps) || 0,
+                Number(RENDER.config.trajContinuityWeight) || 0,
+                Number(RENDER.config.trajContinuityPasses) || 0
+            ]);
+        }
+
+        function rawPointOf(group) {
+            let sumW = 0, sumLat = 0, sumLng = 0;
+            for (const item of group) {
+                const w = item.weight > 0 ? item.weight : 1;
+                sumW += w;
+                sumLat += item.anchor.lat * w;
+                sumLng += item.anchor.lng * w;
+            }
+            return sumW > 0
+                ? { lat: sumLat / sumW, lng: sumLng / sumW }
+                : null;
+        }
+
+        function shortestLngDelta(fromLng, toLng) {
+            return ((toLng - fromLng + 540) % 360) - 180;
+        }
+
+        function normalizeLng(lng) {
+            return ((lng + 540) % 360) - 180;
+        }
+
+        function moveTowardFraction(from, to, fraction) {
+            const f = Math.max(0, Math.min(1, Number(fraction) || 0));
+            return {
+                lat: from.lat + (to.lat - from.lat) * f,
+                lng: normalizeLng(from.lng + shortestLngDelta(from.lng, to.lng) * f)
+            };
+        }
+
+        function distanceMeters(a, b) {
+            return haversineKm(a.lat, a.lng, b.lat, b.lng) * 1000;
+        }
+
+        function projectIntoCircle(point, center, radiusM) {
+            const d = distanceMeters(point, center);
+            if (!Number.isFinite(d) || d <= radiusM || d <= 1e-6) return { ...point };
+            return moveTowardFraction(center, point, radiusM / d);
+        }
+
+        function interactionRadiusForEvent(ev) {
+            if (ev?.type === 'destroy_reso') {
+                return Math.max(0, Number(RENDER.config.destroyPortalRadiusM) || 40) +
+                    Math.max(0, Number(RENDER.config.destroyWeaponRangeM) || 168);
+            }
+            const configured = Number(RENDER.config.interactionRadiusByType?.[ev?.type]);
+            return Number.isFinite(configured) && configured >= 0 ? configured : null;
+        }
+
+        function constrainPoint(basePoint, items, applyDestroyFalloff) {
+            let point = { lat: basePoint.lat, lng: basePoint.lng };
+            const portalRadius = Math.max(0, Number(RENDER.config.destroyPortalRadiusM) || 40);
+            const weaponRange = Math.max(0, Number(RENDER.config.destroyWeaponRangeM) || 168);
+            const falloffStrength = Math.max(0, Number(RENDER.config.destroyFalloffStrength) || 0);
+            const constraints = [];
+
+            for (const item of items) {
+                const radiusM = interactionRadiusForEvent(item.ev);
+                if (radiusM == null) continue;
+                constraints.push({
+                    center: item.anchor,
+                    radiusM,
+                    // Destruction is a broader, weaker location observation.
+                    weight: item.ev.type === 'destroy_reso' ? Math.max(0.25, item.weight) : Math.max(1, item.weight)
+                });
+
+                if (applyDestroyFalloff && item.ev.type === 'destroy_reso' && weaponRange > 0 && falloffStrength > 0) {
+                    point = projectIntoCircle(point, item.anchor, portalRadius + weaponRange);
+                    const portalDistance = distanceMeters(point, item.anchor);
+                    const weaponDistance = Math.max(0, portalDistance - portalRadius);
+                    const ratio = Math.max(0, Math.min(1, weaponDistance / weaponRange));
+                    // A steep but deliberately approximate likelihood prior: far
+                    // XMP hits remain possible, while nearer hits are preferred.
+                    const pull = Math.min(0.8, falloffStrength * (1 - Math.exp(-3 * ratio * ratio)));
+                    point = moveTowardFraction(point, item.anchor, pull);
+                }
+            }
+
+            // Average projections are order-independent. If the interaction
+            // disks overlap this converges inside them; conflicting simultaneous
+            // evidence settles at a weighted soft compromise instead of failing.
+            const steps = Math.max(1, Math.round(Number(RENDER.config.interactionProjectionSteps) || 1));
+            for (let step = 0; step < steps && constraints.length; step++) {
+                let sumLat = 0, sumLng = 0, sumWeight = 0;
+                for (const constraint of constraints) {
+                    const projected = projectIntoCircle(point, constraint.center, constraint.radiusM);
+                    const violation = distanceMeters(point, constraint.center) - constraint.radiusM;
+                    if (violation <= 1e-3) continue;
+                    sumLat += (projected.lat - point.lat) * constraint.weight;
+                    sumLng += shortestLngDelta(point.lng, projected.lng) * constraint.weight;
+                    sumWeight += constraint.weight;
+                }
+                if (sumWeight <= 0) break;
+                point = {
+                    lat: point.lat + sumLat / sumWeight,
+                    lng: normalizeLng(point.lng + sumLng / sumWeight)
+                };
+            }
+
+            let maxViolationM = 0;
+            for (const constraint of constraints) {
+                maxViolationM = Math.max(
+                    maxViolationM,
+                    distanceMeters(point, constraint.center) - constraint.radiusM
+                );
+            }
+            return { point, maxViolationM: Math.max(0, maxViolationM) };
+        }
+
+        function buildUncached(playerName, source) {
+            const evidence = [];
+            for (const ev of source) {
+                if (!ev || ev.player !== playerName || !evidenceTypes.has(ev.type)) continue;
+                const anchor = getEventAnchor(ev);
+                if (!anchor || !Number.isFinite(ev.ts)) continue;
+                evidence.push({ ev, anchor, weight: _weightOfEventType(ev.type) });
+            }
+            evidence.sort((a, b) => a.ev.ts - b.ev.ts);
+            if (!evidence.length) return [];
+
+            // Simultaneous actions are evidence for one position, not several
+            // zero-duration moves, so collapse them into one timeline node.
+            const groups = [];
+            for (const item of evidence) {
+                const ts = item.ev.ts;
+                let group = groups[groups.length - 1];
+                if (!group || group.ts !== ts) {
+                    group = { ts, items: [] };
+                    groups.push(group);
+                }
+                group.items.push(item);
+            }
+
+            const useWeighted = RENDER.config.trajUseWeightedNodes !== false;
+            const win = Math.max(0, Number(RENDER.config.trajSmoothWindowMs) || 0);
+            const minWeight = Math.max(0, Number(RENDER.config.trajMinWeightSum) || 0);
+            let left = 0, right = 0;
+            let sumW = 0, sumLat = 0, sumLng = 0;
+            const nodes = [];
+
+            for (const group of groups) {
+                const lower = group.ts - win;
+                const upper = group.ts + win;
+                while (right < evidence.length && evidence[right].ev.ts <= upper) {
+                    const item = evidence[right++];
+                    if (item.weight > 0) {
+                        sumW += item.weight;
+                        sumLat += item.anchor.lat * item.weight;
+                        sumLng += item.anchor.lng * item.weight;
+                    }
+                }
+                while (left < evidence.length && evidence[left].ev.ts < lower) {
+                    const item = evidence[left++];
+                    if (item.weight > 0) {
+                        sumW -= item.weight;
+                        sumLat -= item.anchor.lat * item.weight;
+                        sumLng -= item.anchor.lng * item.weight;
+                    }
+                }
+
+                const rawPoint = rawPointOf(group.items);
+                const baselinePoint = useWeighted && sumW >= minWeight && sumW > 0
+                    ? { lat: sumLat / sumW, lng: sumLng / sumW }
+                    : rawPoint;
+                if (!baselinePoint) continue;
+                const constrained = constrainPoint(baselinePoint, group.items, true);
+                nodes.push({
+                    ts: group.ts,
+                    point: constrained.point,
+                    baselinePoint,
+                    rawPoint,
+                    maxConstraintViolationM: constrained.maxViolationM,
+                    event: group.items[group.items.length - 1].ev,
+                    events: group.items.map(item => item.ev),
+                    _items: group.items
+                });
+            }
+
+            // Use only a weak adjacent-distance preference to choose among valid
+            // points inside interaction disks. Forward/backward passes keep it
+            // symmetric; there is intentionally no angle, curvature or
+            // acceleration term, so sharp turns and immediate reversals remain.
+            const continuity = Math.max(0, Math.min(1, Number(RENDER.config.trajContinuityWeight) || 0));
+            const passes = Math.max(0, Math.round(Number(RENDER.config.trajContinuityPasses) || 0));
+            for (let pass = 0; pass < passes && continuity > 0; pass++) {
+                for (let i = 1; i < nodes.length; i++) {
+                    const shifted = moveTowardFraction(nodes[i].point, nodes[i - 1].point, continuity);
+                    const constrained = constrainPoint(shifted, nodes[i]._items, false);
+                    nodes[i].point = constrained.point;
+                    nodes[i].maxConstraintViolationM = constrained.maxViolationM;
+                }
+                for (let i = nodes.length - 2; i >= 0; i--) {
+                    const shifted = moveTowardFraction(nodes[i].point, nodes[i + 1].point, continuity);
+                    const constrained = constrainPoint(shifted, nodes[i]._items, false);
+                    nodes[i].point = constrained.point;
+                    nodes[i].maxConstraintViolationM = constrained.maxViolationM;
+                }
+            }
+            for (const node of nodes) delete node._items;
+            return nodes;
+        }
+
+        function seriesForPlayer(playerName, events = STORE.events) {
+            const source = Array.isArray(events) ? events : [];
+            if (source !== STORE.events) return buildUncached(playerName, source);
+
+            const key = configKey();
+            if (cachedEvents !== source || cachedConfigKey !== key) {
+                cachedEvents = source;
+                cachedConfigKey = key;
+                cachedSeries = new Map();
+            }
+            if (!cachedSeries.has(playerName)) {
+                cachedSeries.set(playerName, buildUncached(playerName, source));
+            }
+            return cachedSeries.get(playerName);
+        }
+
+        function positionAt(series, ts) {
+            if (!Array.isArray(series) || !series.length || !Number.isFinite(ts)) return null;
+            if (ts < series[0].ts) return null;
+            const last = series[series.length - 1];
+            if (ts >= last.ts) return { lat: last.point.lat, lng: last.point.lng };
+
+            let lo = 0, hi = series.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (series[mid].ts <= ts) lo = mid + 1;
+                else hi = mid;
+            }
+            const a = series[Math.max(0, lo - 1)];
+            const b = series[lo];
+            if (!a || !b || b.ts <= a.ts) return a?.point || b?.point || null;
+            const ratio = Math.max(0, Math.min(1, (ts - a.ts) / (b.ts - a.ts)));
+            return {
+                lat: a.point.lat + (b.point.lat - a.point.lat) * ratio,
+                lng: a.point.lng + (b.point.lng - a.point.lng) * ratio
+            };
+        }
+
+        return { evidenceTypes, interactionRadiusForEvent, seriesForPlayer, positionAt };
+    })();
+    RENDER.positionModel = POSITION_MODEL;
+    PLUGIN_NS.positionModel = POSITION_MODEL;
 
     const LINK_LIFECYCLES = (function () {
         function build(startTs, endTs, options = {}) {
@@ -1239,44 +1490,22 @@
         };
     })();
 
-    // Build contiguous segments for a given player name from STORE.events
+    // Build contiguous segments from the same inferred position series used by
+    // GIF markers, so both renderers describe one identical movement curve.
     RENDER.buildSegmentsForPlayer = function(playerName) {
-        const all = Array.isArray(STORE.events) ? STORE.events : [];
-        // filter by player and keep only events with a valid anchor
-        const evs = all.filter(ev =>
-                               (ev.player === playerName) &&
-                               !!getEventAnchor(ev) &&
-                               (ev.type === 'capture' || ev.type === 'deploy' || ev.type === 'link' || ev.type === 'destroy_reso')
-                              );
-        // sort by time asc (should already be sorted)
-        evs.sort((a,b) => a.ts - b.ts);
-
+        const series = POSITION_MODEL.seriesForPlayer(playerName);
         const segs = [];
-        for (let i = 1; i < evs.length; i++) {
-            const prev = evs[i - 1];
-            const curr = evs[i];
-            let a1 = getEventAnchor(prev);
-            let a2 = getEventAnchor(curr);
-            if (!a1 || !a2) continue;
-
-            // Remark 1: skip if two adjacent events happened at the SAME portal
-            if (isSamePortal(a1, a2)) continue;
-
-            // 假设此处已有：const evA = evs[i-1]; const evB = evs[i];（两相邻强事件）
-
-            // 加权端点（若失败回退原始锚点）
-            let fromPt = null, toPt = null;
-            if (RENDER.config.trajUseWeightedNodes) {
-                a1 = weightedCentroidForPlayerAtTs(playerName, prev.ts) || getEventAnchor(prev);
-                a2 = weightedCentroidForPlayerAtTs(playerName, curr.ts) || getEventAnchor(curr);
-            } else {
-                a1 = getEventAnchor(prev);
-                a2 = getEventAnchor(curr);
-            }
-            if (!a1 || !a2) continue; // 防御
+        for (let i = 1; i < series.length; i++) {
+            const prevNode = series[i - 1];
+            const currNode = series[i];
+            const prev = prevNode.event;
+            const curr = currNode.event;
+            const a1 = prevNode.point;
+            const a2 = currNode.point;
+            if (!a1 || !a2 || isSamePortal(a1, a2)) continue;
 
             const dKm = haversineKm(a1.lat, a1.lng, a2.lat, a2.lng);
-            const dtMs = Math.max(0, curr.ts - prev.ts);
+            const dtMs = Math.max(0, currNode.ts - prevNode.ts);
             const kmh = (dtMs > 0 && dKm > 0.08) ? ((dKm - 0.08) / (dtMs / 3600000)) : 0;
 
             segs.push({
@@ -1843,16 +2072,6 @@
             };
         }
 
-        function upperBound(events, ts) {
-            let lo = 0, hi = events.length;
-            while (lo < hi) {
-                const mid = (lo + hi) >> 1;
-                if (events[mid].ts <= ts) lo = mid + 1;
-                else hi = mid;
-            }
-            return lo;
-        }
-
         function normalizeTimeWindows(windows, fallbackStart, fallbackEnd) {
             const cleaned = (Array.isArray(windows) ? windows : [])
                 .map(window => ({
@@ -1920,10 +2139,7 @@
             const endTs = timeWindows[timeWindows.length - 1].endTs;
             const byPlayer = new Map();
             for (const player of players) {
-                const events = selectedEvents.filter(ev =>
-                    ev.player === player && ev.type !== 'link_destroyed'
-                );
-                byPlayer.set(player, events);
+                byPlayer.set(player, POSITION_MODEL.seriesForPlayer(player));
             }
             const links = buildLinkLifecycles(startTs, endTs, selectedSet);
             const points = selectedEvents
@@ -1962,18 +2178,6 @@
             ctx.moveTo(p1.x, p1.y);
             ctx.lineTo(p2.x, p2.y);
             ctx.stroke();
-        }
-
-        function eventPositionAt(events, ts) {
-            if (!events.length) return null;
-            if (ts <= events[0].ts) return getEventAnchor(events[0]);
-            const nextIndex = upperBound(events, ts);
-            if (nextIndex >= events.length) return getEventAnchor(events[events.length - 1]);
-            const aEvent = events[nextIndex - 1], bEvent = events[nextIndex];
-            const a = getEventAnchor(aEvent), b = getEventAnchor(bEvent);
-            if (!a || !b || bEvent.ts <= aEvent.ts) return a || b;
-            const ratio = Math.max(0, Math.min(1, (ts - aEvent.ts) / (bEvent.ts - aEvent.ts)));
-            return { lat: a.lat + (b.lat - a.lat) * ratio, lng: a.lng + (b.lng - a.lng) * ratio };
         }
 
         function drawStaticBackground(ctx, model, project, width, height) {
@@ -2094,8 +2298,8 @@
             ctx.font = `${Math.max(11, Math.round(15 * scale))}px sans-serif`;
             ctx.textBaseline = 'middle';
             for (const player of model.players) {
-                const events = model.byPlayer.get(player) || [];
-                const pos = eventPositionAt(events, ts);
+                const series = model.byPlayer.get(player) || [];
+                const pos = POSITION_MODEL.positionAt(series, ts);
                 const team = STORE.playerIndex?.[player]?.team || null;
                 const color = COLORS.resolve(player, team);
                 if (pos) {
