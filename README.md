@@ -1,6 +1,8 @@
 # IITC Trajectory Replay Toolkit
 
-![Demo](examples/trajectory-20261017-1836.gif)
+<p align="center">
+  <img src="examples/trajectory-20261017-1836.gif" alt="Demo" width="600">
+</p>
 
 This toolkit turns exported IITC COMM activity into an interactive map replay and a compact, shareable GIF. It consists of three IITC userscripts:
 
