@@ -2,7 +2,7 @@
 // @id             iitc-plugin-trajectory-loader
 // @name           IITC plugin: Trajectory Loader
 // @category       Layer
-// @version        2.0.001
+// @version        2.1.001
 // @match          https://intel.ingress.com/*
 // @grant          none
 // @run-at         document-end
@@ -11,7 +11,7 @@
 (function wrapper(plugin_info) {
     if (typeof window.plugin !== 'function') window.plugin = function () {};
     plugin_info.pluginId = 'iitc-plugin-trajectory-loader';
-    plugin_info.dateTimeVersion = '2026101502';
+    plugin_info.dateTimeVersion = '2026101703';
     plugin_info.buildName = 'beta';
 
     window.IITC = window.IITC || {};
@@ -31,7 +31,12 @@
             players: {}      // { playerName: count } - optional pre-aggregation for next steps
         }
     });
-    if (!Object.prototype.hasOwnProperty.call(STORE, 'snapshot')) STORE.snapshot = null;
+    if (!Array.isArray(STORE.snapshots)) {
+        STORE.snapshots = STORE.snapshot ? [STORE.snapshot] : [];
+    }
+    STORE.snapshot = STORE.snapshots[STORE.snapshots.length - 1] || null; // legacy alias
+    if (!Object.prototype.hasOwnProperty.call(STORE, 'linkLifecycleAudit')) STORE.linkLifecycleAudit = null;
+    if (!Object.prototype.hasOwnProperty.call(STORE, 'shards')) STORE.shards = null;
 
     // ---------- Colors / Player palette ----------
     const COLORS = (function() {
@@ -593,12 +598,15 @@
     }
 
     function canonicalPortalKey(portal) {
-        if (portal?.guid) return `g:${portal.guid}`;
+        // COMM endpoints do not consistently carry GUIDs, whereas snapshots
+        // normally do. Coordinates are therefore the cross-source identity;
+        // GUID is only a fallback for records with no usable position.
         const lat = Number(portal?.lat);
         const lng = Number(portal?.lng);
-        return Number.isFinite(lat) && Number.isFinite(lng)
-            ? `c:${lat.toFixed(6)},${lng.toFixed(6)}`
-            : null;
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            return `c:${Math.round(lat * 1e6)},${Math.round(lng * 1e6)}`;
+        }
+        return portal?.guid ? `g:${portal.guid}` : null;
     }
 
     function canonicalLinkKey(a, b) {
@@ -606,6 +614,32 @@
         const right = canonicalPortalKey(b);
         if (!left || !right) return null;
         return left < right ? `${left}|${right}` : `${right}|${left}`;
+    }
+
+    function portalPointsEqual(a, b) {
+        return canonicalPortalKey(a) === canonicalPortalKey(b);
+    }
+
+    function orientation(a, b, c) {
+        return (Number(b.lng) - Number(a.lng)) * (Number(c.lat) - Number(a.lat)) -
+            (Number(b.lat) - Number(a.lat)) * (Number(c.lng) - Number(a.lng));
+    }
+
+    function linksProperlyCross(a, b, c, d) {
+        if (![a, b, c, d].every(point => Number.isFinite(Number(point?.lat)) && Number.isFinite(Number(point?.lng)))) {
+            return false;
+        }
+        if (portalPointsEqual(a, c) || portalPointsEqual(a, d) ||
+            portalPointsEqual(b, c) || portalPointsEqual(b, d)) return false;
+        const min = (x, y) => Math.min(Number(x), Number(y));
+        const max = (x, y) => Math.max(Number(x), Number(y));
+        if (max(a.lng, b.lng) <= min(c.lng, d.lng) || max(c.lng, d.lng) <= min(a.lng, b.lng) ||
+            max(a.lat, b.lat) <= min(c.lat, d.lat) || max(c.lat, d.lat) <= min(a.lat, b.lat)) return false;
+        const o1 = orientation(a, b, c);
+        const o2 = orientation(a, b, d);
+        const o3 = orientation(c, d, a);
+        const o4 = orientation(c, d, b);
+        return o1 * o2 < 0 && o3 * o4 < 0;
     }
 
     function finiteTimestamp(...values) {
@@ -718,7 +752,7 @@
             byKey.set(key, normalized);
         }
 
-        STORE.snapshot = {
+        const normalizedSnapshot = {
             name: String(metadata.name || 'snapshot.json'),
             size: Number(metadata.size) || 0,
             loadedAt: Date.now(),
@@ -731,9 +765,21 @@
             },
             links: Array.from(byKey.values()),
             skippedLinks,
-            duplicateLinks
+            duplicateLinks,
+            map: parsed.map || null,
+            scope: parsed.scope || null,
+            validation: null,
+            lastMergeStats: null
         };
-        return STORE.snapshot;
+        const existingIndex = STORE.snapshots.findIndex(item =>
+            item.capturedAtMs === normalizedSnapshot.capturedAtMs ||
+            (item.name === normalizedSnapshot.name && item.size === normalizedSnapshot.size)
+        );
+        if (existingIndex >= 0) STORE.snapshots.splice(existingIndex, 1, normalizedSnapshot);
+        else STORE.snapshots.push(normalizedSnapshot);
+        STORE.snapshots.sort((left, right) => left.capturedAtMs - right.capturedAtMs);
+        STORE.snapshot = STORE.snapshots[STORE.snapshots.length - 1] || null;
+        return normalizedSnapshot;
     }
 
     async function loadSnapshotFile(file) {
@@ -749,8 +795,154 @@
     const SNAPSHOT = (PLUGIN_NS.snapshot = PLUGIN_NS.snapshot || {});
     SNAPSHOT.loadObject = loadSnapshotObject;
     SNAPSHOT.loadFile = loadSnapshotFile;
-    SNAPSHOT.clear = () => { STORE.snapshot = null; };
+    SNAPSHOT.clear = () => {
+        STORE.snapshots = [];
+        STORE.snapshot = null;
+        STORE.linkLifecycleAudit = null;
+    };
     Object.defineProperty(SNAPSHOT, 'current', { configurable: true, get: () => STORE.snapshot });
+    Object.defineProperty(SNAPSHOT, 'all', { configurable: true, get: () => STORE.snapshots.slice() });
+
+    // ---- Shard jump history ----
+    function shardPortalPoint(info) {
+        if (!info || typeof info !== 'object') return null;
+        const point = snapshotPoint(null, info.latE6, info.lngE6, info.position);
+        if (!point) return null;
+        return {
+            ...point,
+            title: String(info.title || info.name || ''),
+            team: normalizeSnapshotFaction(info.team)
+        };
+    }
+
+    function sameShardPoint(a, b) {
+        return !!a && !!b && Math.abs(a.lat - b.lat) < 1e-9 && Math.abs(a.lng - b.lng) < 1e-9;
+    }
+
+    function loadShardObject(parsed, metadata = {}) {
+        if (!parsed || !Array.isArray(parsed.artifact)) {
+            throw new Error('Expected a shard jump history JSON file with an "artifact" array');
+        }
+
+        const fragments = [];
+        let sourceHistoryCount = 0;
+        let skippedHistoryCount = 0;
+        let moveCount = 0;
+        let startTs = Infinity;
+        let endTs = -Infinity;
+
+        for (const artifact of parsed.artifact) {
+            const rawFragments = Array.isArray(artifact?.fragment) ? artifact.fragment : [];
+            for (const fragment of rawFragments) {
+                const rawHistory = Array.isArray(fragment?.history) ? fragment.history : [];
+                sourceHistoryCount += rawHistory.length;
+                const ordered = rawHistory
+                    .map(entry => ({ entry, ts: finiteTimestamp(entry?.moveTimeMs) }))
+                    .filter(item => {
+                        if (item.ts !== null) return true;
+                        skippedHistoryCount += 1;
+                        return false;
+                    })
+                    .sort((a, b) => a.ts - b.ts);
+
+                let lastPoint = null;
+                const samples = [];
+                for (const item of ordered) {
+                    const entry = item.entry || {};
+                    const origin = shardPortalPoint(entry.originPortalInfo);
+                    const destination = shardPortalPoint(entry.destinationPortalInfo);
+                    if (destination) lastPoint = destination;
+                    else if (!lastPoint && origin) lastPoint = origin;
+                    if (!lastPoint) {
+                        skippedHistoryCount += 1;
+                        continue;
+                    }
+
+                    const reason = String(entry.reason || 'unknown').toLowerCase();
+                    if (reason === 'link' || reason === 'spawn') moveCount += 1;
+                    const sample = {
+                        ts: item.ts,
+                        point: { ...lastPoint },
+                        reason,
+                        origin,
+                        destination,
+                        linkCreationTs: finiteTimestamp(entry.linkCreationTimeMs),
+                        linkCreatorTeam: normalizeSnapshotFaction(entry.linkCreatorTeam),
+                        direction: entry.linkOriginatedFromOriginPortal || null
+                    };
+                    // Multiple records at the same time describe one known state.
+                    const previous = samples[samples.length - 1];
+                    if (previous?.ts === sample.ts) samples[samples.length - 1] = sample;
+                    else samples.push(sample);
+                    startTs = Math.min(startTs, sample.ts);
+                    endTs = Math.max(endTs, sample.ts);
+                }
+
+                const currentPoint = shardPortalPoint(fragment?.currentPortalInfo);
+                // A currentPortalInfo without a timestamp cannot be placed on
+                // the replay timeline, so only time-indexed fragments are kept.
+                if (!samples.length) continue;
+                if (samples.length && currentPoint && sameShardPoint(samples[samples.length - 1].point, currentPoint)) {
+                    samples[samples.length - 1].point = currentPoint;
+                }
+                fragments.push({
+                    artifactId: String(artifact?.id || ''),
+                    artifactName: String(artifact?.name || artifact?.id || 'Artifact'),
+                    id: String(fragment?.id || `${artifact?.id || 'artifact'}_${fragments.length + 1}`),
+                    currentPoint,
+                    samples
+                });
+            }
+        }
+
+        if (!fragments.length) throw new Error('Shard history contains no fragment positions');
+        STORE.shards = {
+            name: String(metadata.name || 'shard-jump-history.json'),
+            size: Number(metadata.size) || 0,
+            loadedAt: Date.now(),
+            fragments,
+            sourceHistoryCount,
+            skippedHistoryCount,
+            moveCount,
+            startTs: Number.isFinite(startTs) ? startTs : null,
+            endTs: Number.isFinite(endTs) ? endTs : null
+        };
+        try { PLUGIN_NS.render?.shards?.setFragments?.(fragments); } catch (_) {}
+        return STORE.shards;
+    }
+
+    async function loadShardFile(file) {
+        let parsed;
+        try {
+            parsed = JSON.parse(await readFileAsText(file));
+        } catch (error) {
+            throw new Error(`Invalid shard JSON: ${error?.message || error}`);
+        }
+        return loadShardObject(parsed, { name: file.name, size: file.size });
+    }
+
+    function shardPositionAt(fragment, ts) {
+        const samples = Array.isArray(fragment?.samples) ? fragment.samples : [];
+        if (!samples.length || !Number.isFinite(Number(ts)) || Number(ts) < samples[0].ts) return null;
+        let lo = 0, hi = samples.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (samples[mid].ts <= Number(ts)) lo = mid + 1;
+            else hi = mid;
+        }
+        return samples[Math.max(0, lo - 1)] || null;
+    }
+
+    const SHARDS = (PLUGIN_NS.shards = PLUGIN_NS.shards || {});
+    SHARDS.loadObject = loadShardObject;
+    SHARDS.loadFile = loadShardFile;
+    SHARDS.positionAt = shardPositionAt;
+    SHARDS.clear = () => {
+        STORE.shards = null;
+        try { PLUGIN_NS.render?.shards?.clear?.(); } catch (_) {}
+    };
+    Object.defineProperty(SHARDS, 'current', { configurable: true, get: () => STORE.shards });
+    SHARDS._test = { shardPortalPoint, shardPositionAt };
 
     async function loadAndMerge(files, progressCb) {
         const summaries = [];
@@ -907,6 +1099,8 @@
         };
 
     }
+
+    PLUGIN_NS.loadAndMerge = loadAndMerge;
 
     // ---- Render / Tracks ----
     const RENDER = (PLUGIN_NS.render = PLUGIN_NS.render || {});
@@ -1299,17 +1493,106 @@
     PLUGIN_NS.positionModel = POSITION_MODEL;
 
     const LINK_LIFECYCLES = (function () {
+        let lastAudit = null;
+
+        function pointForAudit(point) {
+            return point ? { lat: Number(point.lat), lng: Number(point.lng), guid: point.guid || null } : null;
+        }
+
+        function linkForAudit(link) {
+            return {
+                key: link.key,
+                a: pointForAudit(link.a),
+                b: pointForAudit(link.b),
+                createdBy: link.createdBy || null,
+                destroyedBy: link.destroyedBy || null
+            };
+        }
+
+        function validateSnapshot(snapshot) {
+            if (snapshot.validation?.sourceLinks === snapshot.links.length) return snapshot.validation;
+            const links = snapshot.links.slice();
+            const adjacency = links.map(() => new Set());
+            for (let i = 0; i < links.length; i++) {
+                for (let j = i + 1; j < links.length; j++) {
+                    if (!linksProperlyCross(links[i].a, links[i].b, links[j].a, links[j].b)) continue;
+                    adjacency[i].add(j);
+                    adjacency[j].add(i);
+                }
+            }
+            const active = new Set(links.map((_, index) => index));
+            const rejected = [];
+            while (true) {
+                let selected = -1;
+                let selectedDegree = 0;
+                for (const index of active) {
+                    let degree = 0;
+                    for (const other of adjacency[index]) if (active.has(other)) degree += 1;
+                    if (degree > selectedDegree || (degree === selectedDegree && degree > 0 &&
+                        Number(links[index].timestamp ?? -Infinity) < Number(links[selected]?.timestamp ?? Infinity))) {
+                        selected = index;
+                        selectedDegree = degree;
+                    }
+                }
+                if (selected < 0 || selectedDegree === 0) break;
+                const crossed = Array.from(adjacency[selected]).filter(index => active.has(index));
+                rejected.push({ link: links[selected], crossed, degree: selectedDegree });
+                active.delete(selected);
+            }
+            snapshot.validation = {
+                sourceLinks: links.length,
+                crossingPairs: adjacency.reduce((sum, set) => sum + set.size, 0) / 2,
+                accepted: Array.from(active, index => links[index]),
+                rejected
+            };
+            return snapshot.validation;
+        }
+
         function build(startTs, endTs, options = {}) {
             const selectedSet = options.selectedSet instanceof Set ? options.selectedSet : null;
             const source = (Array.isArray(options.events) ? options.events : (STORE.events || []))
+                .filter(ev => (ev.type === 'link' || ev.type === 'link_destroyed') && ev.portals?.length >= 2)
                 .slice()
                 .sort((a, b) => a.ts - b.ts);
+            const snapshots = options.includeSnapshot === false
+                ? []
+                : (STORE.snapshots || []).slice().sort((a, b) => a.capturedAtMs - b.capturedAtMs);
+            const auditEntries = [];
+            const snapshotObservations = [];
+
+            for (const snapshot of snapshots) {
+                const validation = validateSnapshot(snapshot);
+                for (const rejected of validation.rejected) {
+                    auditEntries.push({
+                        type: 'snapshot_crossing_rejected',
+                        atTs: snapshot.capturedAtMs,
+                        snapshot: snapshot.name,
+                        link: linkForAudit(rejected.link),
+                        crossingCount: rejected.degree,
+                        reason: 'Snapshot cache contains mutually crossing links'
+                    });
+                }
+                for (const link of validation.accepted) {
+                    snapshotObservations.push({
+                        kind: 'snapshot',
+                        ts: snapshot.capturedAtMs,
+                        snapshot,
+                        link: { ...link, key: link.key || canonicalLinkKey(link.a, link.b) }
+                    });
+                }
+            }
+
+            const evidenceStarts = [source[0]?.ts, snapshots[0]?.capturedAtMs, startTs]
+                .map(Number).filter(Number.isFinite);
+            const evidenceStartTs = evidenceStarts.length ? Math.min(...evidenceStarts) : Number(startTs) || 0;
             const result = [];
             const byKey = new Map();
-            const open = new Map();
-            const eventTimes = new Map();
+            const active = new Map();
 
             function addRecord(record) {
+                record.snapshotTimes = record.snapshotTimes || [];
+                record.snapshotNames = record.snapshotNames || [];
+                record.renderable = record.renderable !== false;
                 result.push(record);
                 let bucket = byKey.get(record.key);
                 if (!bucket) byKey.set(record.key, bucket = []);
@@ -1317,19 +1600,58 @@
                 return record;
             }
 
-            for (const ev of source) {
-                if ((ev.type !== 'link' && ev.type !== 'link_destroyed') || ev.portals?.length < 2) continue;
-                const a = ev.portals[0];
-                const b = ev.portals[1];
-                const key = canonicalLinkKey(a, b);
-                if (!key) continue;
-                let times = eventTimes.get(key);
-                if (!times) eventTimes.set(key, times = []);
-                times.push(ev.ts);
+            function closeRecord(record, ts, destroyedBy = null, faction = null) {
+                record.deadTs = Math.min(record.deadTs, ts);
+                if (destroyedBy) record.destroyedBy = destroyedBy;
+                if (!record.faction && faction) record.faction = faction;
+                if (active.get(record.key) === record) active.delete(record.key);
+            }
 
-                if (ev.type === 'link') {
-                    const previous = open.get(key);
-                    if (previous) previous.deadTs = Math.max(previous.bornTs + 1, ev.ts);
+            function activeCrossings(a, b, exceptKey = null) {
+                return Array.from(active.values()).filter(record =>
+                    record.key !== exceptKey && linksProperlyCross(a, b, record.a, record.b)
+                );
+            }
+
+            const timeline = source.map((ev, index) => ({
+                kind: ev.type === 'link' ? 'create' : 'destroy',
+                ts: ev.ts,
+                ev,
+                index
+            })).concat(snapshotObservations);
+            const priority = { destroy: 0, snapshot: 1, create: 2 };
+            timeline.sort((left, right) => left.ts - right.ts ||
+                priority[left.kind] - priority[right.kind] || (left.index || 0) - (right.index || 0));
+
+            for (const item of timeline) {
+                if (item.kind === 'create') {
+                    const ev = item.ev;
+                    const a = ev.portals[0];
+                    const b = ev.portals[1];
+                    const key = canonicalLinkKey(a, b);
+                    if (!key) continue;
+                    const previous = active.get(key);
+                    if (previous) {
+                        closeRecord(previous, ev.ts);
+                        auditEntries.push({
+                            type: 'same_link_recreated',
+                            atTs: ev.ts,
+                            link: linkForAudit(previous),
+                            createdBy: ev.player || null
+                        });
+                    }
+                    for (const crossed of activeCrossings(a, b, key)) {
+                        closeRecord(crossed, ev.ts);
+                        crossed.crossingCutAt = ev.ts;
+                        crossed.inferenceConflict = true;
+                        auditEntries.push({
+                            type: 'crossing_cut',
+                            atTs: ev.ts,
+                            link: linkForAudit(crossed),
+                            crossedBy: { key, a: pointForAudit(a), b: pointForAudit(b), createdBy: ev.player || null },
+                            reason: 'A newly created link cannot cross a surviving link'
+                        });
+                    }
                     const record = addRecord({
                         key, a, b,
                         bornTs: ev.ts,
@@ -1339,89 +1661,162 @@
                         destroyedBy: null,
                         fromSnapshot: false,
                         snapshotGuid: null,
-                        inferenceConflict: false
+                        inferenceConflict: false,
+                        evidence: 'comm_create',
+                        evidenceTs: ev.ts,
+                        backfillEligible: false
                     });
-                    open.set(key, record);
-                } else {
-                    const record = open.get(key);
+                    active.set(key, record);
+                    continue;
+                }
+
+                if (item.kind === 'destroy') {
+                    const ev = item.ev;
+                    const a = ev.portals[0];
+                    const b = ev.portals[1];
+                    const key = canonicalLinkKey(a, b);
+                    if (!key) continue;
+                    const record = active.get(key);
                     if (record) {
-                        record.deadTs = Math.max(record.bornTs + 1, ev.ts);
-                        record.destroyedBy = ev.player || null;
-                        if (!record.faction && ev.faction) record.faction = ev.faction;
-                        open.delete(key);
+                        closeRecord(record, ev.ts, ev.player || null, ev.faction || null);
                     } else {
-                        addRecord({
+                        const blockers = activeCrossings(a, b, key);
+                        const inferred = addRecord({
                             key, a, b,
-                            bornTs: startTs,
+                            bornTs: ev.ts - 1,
                             deadTs: ev.ts,
                             faction: ev.faction || null,
                             createdBy: null,
                             destroyedBy: ev.player || null,
                             fromSnapshot: false,
                             snapshotGuid: null,
-                            inferenceConflict: false
+                            inferenceConflict: blockers.length > 0,
+                            evidence: 'comm_destroy_only',
+                            evidenceTs: ev.ts,
+                            backfillEligible: blockers.length === 0,
+                            renderable: blockers.length === 0
+                        });
+                        auditEntries.push({
+                            type: blockers.length ? 'destroy_conflict' : 'missing_creation',
+                            atTs: ev.ts,
+                            link: linkForAudit(inferred),
+                            blockers: blockers.map(linkForAudit),
+                            reason: blockers.length
+                                ? 'Destroyed link conflicts with links known to be alive at the same time'
+                                : 'Destruction has no matching creation or earlier snapshot observation'
                         });
                     }
+                    continue;
+                }
+
+                const snapshot = item.snapshot;
+                const link = item.link;
+                if (!link.key) continue;
+                const observed = active.get(link.key);
+                if (observed) {
+                    observed.fromSnapshot = true;
+                    observed.snapshotGuid ||= link.guid || null;
+                    observed.snapshotTimes.push(item.ts);
+                    observed.snapshotNames.push(snapshot.name);
+                    if (!observed.faction) observed.faction = link.faction || null;
+                    continue;
+                }
+                const blockers = activeCrossings(link.a, link.b, link.key);
+                if (blockers.length) {
+                    auditEntries.push({
+                        type: 'snapshot_conflict',
+                        atTs: item.ts,
+                        snapshot: snapshot.name,
+                        link: linkForAudit(link),
+                        blockers: blockers.map(linkForAudit),
+                        reason: 'Snapshot observation crosses a COMM-supported live link'
+                    });
+                    continue;
+                }
+                const prior = (byKey.get(link.key) || []).filter(record => record.deadTs <= item.ts);
+                const missingRecreation = prior.length > 0;
+                const record = addRecord({
+                    key: link.key,
+                    a: link.a,
+                    b: link.b,
+                    bornTs: item.ts,
+                    deadTs: Infinity,
+                    faction: link.faction || null,
+                    createdBy: null,
+                    destroyedBy: null,
+                    fromSnapshot: true,
+                    snapshotGuid: link.guid || null,
+                    inferenceConflict: missingRecreation,
+                    evidence: 'snapshot',
+                    evidenceTs: item.ts,
+                    snapshotTimes: [item.ts],
+                    snapshotNames: [snapshot.name],
+                    backfillEligible: !missingRecreation
+                });
+                active.set(link.key, record);
+                if (missingRecreation) {
+                    auditEntries.push({
+                        type: 'missing_recreation',
+                        atTs: item.ts,
+                        snapshot: snapshot.name,
+                        link: linkForAudit(record),
+                        previousDeadTs: Math.max(...prior.map(candidate => candidate.deadTs)),
+                        reason: 'Snapshot proves the link returned after an earlier death or inferred crossing cut'
+                    });
                 }
             }
 
-            let supplemented = 0;
-            let matched = 0;
-            let conflicts = 0;
-            if (options.includeSnapshot !== false && STORE.snapshot?.links?.length) {
-                for (const snapshotLink of STORE.snapshot.links) {
-                    const key = snapshotLink.key || canonicalLinkKey(snapshotLink.a, snapshotLink.b);
-                    if (!key) continue;
-                    const capturedAt = finiteTimestamp(snapshotLink.capturedAtMs, STORE.snapshot.capturedAtMs);
-                    if (capturedAt === null) continue;
-                    const candidates = byKey.get(key) || [];
-                    let observed = candidates.find(record =>
-                        record.bornTs <= capturedAt && capturedAt < record.deadTs
-                    );
-                    if (observed) {
-                        observed.fromSnapshot = true;
-                        observed.snapshotGuid = snapshotLink.guid || null;
-                        if (!observed.faction) observed.faction = snapshotLink.faction || null;
-                        matched += 1;
-                        continue;
+            // Backfill only across intervals for which no contradictory spatial
+            // evidence exists. This makes inference independent of GIF windows.
+            const inferred = result
+                .filter(record => record.backfillEligible && (record.evidence === 'snapshot' || record.evidence === 'comm_destroy_only'))
+                .sort((left, right) => left.evidenceTs - right.evidenceTs);
+            for (const record of inferred) {
+                let lowerBound = evidenceStartTs;
+                const spatialConstraints = [];
+                const priorSame = (byKey.get(record.key) || []).filter(candidate =>
+                    candidate !== record && candidate.deadTs <= record.evidenceTs
+                );
+                if (priorSame.length) {
+                    lowerBound = Math.max(lowerBound, ...priorSame.map(candidate => candidate.deadTs));
+                }
+                let impossible = false;
+                for (const other of result) {
+                    if (other === record || !other.renderable || other.key === record.key) continue;
+                    if (!linksProperlyCross(record.a, record.b, other.a, other.b)) continue;
+                    if (other.bornTs >= record.evidenceTs || other.deadTs <= lowerBound) continue;
+                    if (other.deadTs <= record.evidenceTs) {
+                        if (other.deadTs > lowerBound) spatialConstraints.push(linkForAudit(other));
+                        lowerBound = Math.max(lowerBound, other.deadTs);
                     }
-
-                    // IITC link entity timestamps are not reliable creation
-                    // times: field/tile updates can stamp an older baseline
-                    // link with the time a later triangle was completed. A
-                    // snapshot-only link is therefore initial state and starts
-                    // at the replay boundary. Explicit COMM events still split
-                    // or close its lifecycle below.
-                    let bornTs = startTs;
-                    let latestDeath = -Infinity;
-                    for (const record of candidates) {
-                        if (record.deadTs <= capturedAt) latestDeath = Math.max(latestDeath, record.deadTs);
-                    }
-                    let inferenceConflict = false;
-                    if (bornTs > capturedAt || bornTs <= latestDeath) {
-                        bornTs = capturedAt;
-                        inferenceConflict = true;
-                        conflicts += 1;
-                    }
-                    const nextBoundary = (eventTimes.get(key) || []).find(ts => ts > capturedAt) ?? Infinity;
-                    addRecord({
-                        key,
-                        a: snapshotLink.a,
-                        b: snapshotLink.b,
-                        bornTs,
-                        deadTs: nextBoundary,
-                        faction: snapshotLink.faction || null,
-                        createdBy: null,
-                        destroyedBy: null,
-                        fromSnapshot: true,
-                        snapshotGuid: snapshotLink.guid || null,
-                        inferenceConflict
+                    else impossible = true;
+                }
+                if (impossible || lowerBound >= record.evidenceTs) {
+                    if (record.evidence === 'comm_destroy_only') record.renderable = false;
+                    record.inferenceConflict = true;
+                    auditEntries.push({
+                        type: 'backfill_conflict',
+                        atTs: record.evidenceTs,
+                        link: linkForAudit(record),
+                        reason: 'No non-crossing interval can be inferred before this observation'
                     });
-                    supplemented += 1;
+                    continue;
+                }
+                record.bornTs = lowerBound;
+                if (spatialConstraints.length) {
+                    auditEntries.push({
+                        type: 'backfill_constrained',
+                        atTs: record.evidenceTs,
+                        inferredBornTs: lowerBound,
+                        link: linkForAudit(record),
+                        constraints: spatialConstraints,
+                        reason: 'Backward inference stops after known crossing links cease to exist'
+                    });
                 }
             }
 
             const visible = result
+                .filter(record => record.renderable && record.deadTs > record.bornTs)
                 .filter(record => record.bornTs <= endTs && record.deadTs > startTs)
                 .filter(record => !selectedSet || record.fromSnapshot ||
                     selectedSet.has(record.createdBy) || selectedSet.has(record.destroyedBy))
@@ -1432,18 +1827,35 @@
                     deadTs: Number.isFinite(record.deadTs) ? record.deadTs : endTs + 1
                 }));
 
-            if (STORE.snapshot) {
-                STORE.snapshot.lastMergeStats = {
-                    supplemented,
-                    matched,
-                    conflicts,
-                    visible: visible.filter(record => record.fromSnapshot).length
+            const counts = auditEntries.reduce((summary, entry) => {
+                summary[entry.type] = (summary[entry.type] || 0) + 1;
+                return summary;
+            }, {});
+            lastAudit = STORE.linkLifecycleAudit = {
+                format: 'iitc-link-lifecycle-audit',
+                formatVersion: 1,
+                generatedAt: new Date().toISOString(),
+                range: { startTs, endTs, evidenceStartTs },
+                counts,
+                entries: auditEntries
+            };
+            for (const snapshot of snapshots) {
+                snapshot.lastMergeStats = {
+                    visible: visible.filter(record => record.snapshotNames?.includes(snapshot.name)).length,
+                    conflicts: auditEntries.filter(entry => entry.snapshot === snapshot.name &&
+                        entry.type === 'snapshot_conflict').length,
+                    rejected: snapshot.validation?.rejected?.length || 0,
+                    crossingPairs: snapshot.validation?.crossingPairs || 0
                 };
             }
             return visible;
         }
 
-        return { build };
+        return {
+            build,
+            validateSnapshot,
+            get audit() { return lastAudit; }
+        };
     })();
     PLUGIN_NS.linkLifecycles = LINK_LIFECYCLES;
 
@@ -1487,6 +1899,116 @@
             get now() { return t; }, get playing() { return playing; },
             get startTs() { return t0; }, get endTs() { return tEnd; },
             get speed() { return speed; },
+        };
+    })();
+
+    // Shard positions share the virtual clock used by links, halos and the UI.
+    // A fragment appears at its spawn and remains at its last known destination.
+    RENDER.shards = (function () {
+        const state = {
+            layer: null,
+            fragments: [],
+            markers: new Map(),
+            now: null,
+            unsub: null
+        };
+
+        function ensureLayer() {
+            if (!state.layer) state.layer = new L.LayerGroup().addTo(window.map);
+            return state.layer;
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[char]);
+        }
+
+        function popupHtml(fragment, sample) {
+            const title = sample?.point?.title ? `<div>${escapeHtml(sample.point.title)}</div>` : '';
+            const reason = sample?.reason ? `<div>${escapeHtml(sample.reason)}</div>` : '';
+            return `<strong>${escapeHtml(fragment.id)}</strong>${title}${reason}<div>${formatDateTime(sample.ts)}</div>`;
+        }
+
+        function createMarker(fragment, sample) {
+            const marker = L.circleMarker([sample.point.lat, sample.point.lng], {
+                radius: 10,
+                color: '#ffffff',
+                weight: 3,
+                opacity: 1,
+                fill: true,
+                fillColor: '#ffcc00',
+                fillOpacity: 0.95
+            });
+            marker.bindTooltip(fragment.id, {
+                permanent: true,
+                direction: 'top',
+                opacity: 0.95,
+                className: 'trajectory-loader-shard-label'
+            });
+            marker.bindPopup(popupHtml(fragment, sample));
+            marker.addTo(ensureLayer());
+            try { marker.bringToFront(); } catch (_) {}
+            return { marker, sampleTs: sample.ts };
+        }
+
+        function update(ts = state.now) {
+            state.now = Number(ts);
+            if (!Number.isFinite(state.now)) return;
+            const activeIds = new Set();
+            for (const fragment of state.fragments) {
+                const sample = SHARDS.positionAt(fragment, state.now);
+                if (!sample?.point) continue;
+                activeIds.add(fragment.id);
+                let record = state.markers.get(fragment.id);
+                if (!record) {
+                    record = createMarker(fragment, sample);
+                    state.markers.set(fragment.id, record);
+                } else {
+                    record.marker.setLatLng([sample.point.lat, sample.point.lng]);
+                    if (record.sampleTs !== sample.ts) {
+                        record.sampleTs = sample.ts;
+                        try { record.marker.setPopupContent(popupHtml(fragment, sample)); } catch (_) {}
+                    }
+                    try { record.marker.bringToFront(); } catch (_) {}
+                }
+            }
+            for (const [id, record] of Array.from(state.markers.entries())) {
+                if (activeIds.has(id)) continue;
+                try {
+                    if (state.layer?.removeLayer) state.layer.removeLayer(record.marker);
+                    else record.marker.remove();
+                } catch (_) {}
+                state.markers.delete(id);
+            }
+        }
+
+        function ensureSubscribed() {
+            if (state.unsub) return;
+            state.unsub = RENDER.clock.on((tPrev, tNow) => update(tNow));
+        }
+
+        ensureSubscribed();
+        return {
+            setFragments(fragments) {
+                state.fragments = Array.isArray(fragments) ? fragments.slice() : [];
+                if (!state.fragments.length) {
+                    this.clearVisuals();
+                    return;
+                }
+                update(Number.isFinite(state.now) ? state.now : RENDER.clock.now);
+            },
+            setNow(ts) { update(ts); },
+            clearVisuals() {
+                if (state.layer) state.layer.clearLayers();
+                state.markers.clear();
+            },
+            clear() {
+                this.clearVisuals();
+                state.fragments = [];
+                state.now = null;
+            },
+            get fragments() { return state.fragments.slice(); }
         };
     })();
 
@@ -2142,12 +2664,27 @@
                 byPlayer.set(player, POSITION_MODEL.seriesForPlayer(player));
             }
             const links = buildLinkLifecycles(startTs, endTs, selectedSet);
+            const overlayOptions = {
+                playerNames: options.showPlayerNames !== false,
+                shards: options.showShards !== false
+            };
+            const shards = overlayOptions.shards && Array.isArray(STORE.shards?.fragments)
+                ? STORE.shards.fragments.map(fragment => ({
+                    ...fragment,
+                    samples: Array.isArray(fragment.samples) ? fragment.samples.slice() : []
+                }))
+                : [];
             const points = selectedEvents
                 .filter(ev => timeWindows.some(window => ev.ts >= window.startTs && ev.ts <= window.endTs))
                 .map(getEventAnchor);
             for (const link of links) {
                 if (!link.fromSnapshot) continue;
                 points.push(link.a, link.b);
+            }
+            for (const fragment of shards) {
+                for (const sample of fragment.samples) {
+                    if (sample?.point) points.push(sample.point);
+                }
             }
             if (!points.length) {
                 for (const ev of selectedEvents) points.push(getEventAnchor(ev));
@@ -2166,9 +2703,9 @@
             // long link can shrink the actual trajectory to an unreadable dot;
             // links still render and are naturally clipped at the canvas edge.
             return {
-                players, selectedSet, selectedEvents, byPlayer,
+                players, selectedSet, selectedEvents, byPlayer, shards,
                 links, points, startTs, endTs, timeWindows, viewport,
-                layerOptions, backgroundPortals, metricScale, basemapSnapshot
+                layerOptions, overlayOptions, backgroundPortals, metricScale, basemapSnapshot
             };
         }
 
@@ -2258,6 +2795,39 @@
             ctx.restore();
         }
 
+        function drawShardMarkers(ctx, model, project, ts, width, height, scale) {
+            for (const fragment of (model.shards || [])) {
+                const sample = SHARDS.positionAt(fragment, ts);
+                if (!sample?.point) continue;
+                const p = project(sample.point);
+                if (p.x < 0 || p.y < 0 || p.x > width || p.y > height) continue;
+                const radius = Math.max(7, 9 * scale);
+                ctx.save();
+                ctx.globalAlpha = 1;
+                ctx.translate(p.x, p.y);
+                ctx.rotate(Math.PI / 4);
+                ctx.fillStyle = '#ffcc00';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = Math.max(2, 2.5 * scale);
+                ctx.fillRect(-radius * 0.72, -radius * 0.72, radius * 1.44, radius * 1.44);
+                ctx.strokeRect(-radius * 0.72, -radius * 0.72, radius * 1.44, radius * 1.44);
+                ctx.restore();
+
+                const label = fragment.id;
+                ctx.save();
+                ctx.font = `bold ${Math.max(10, Math.round(13 * scale))}px sans-serif`;
+                ctx.textBaseline = 'middle';
+                ctx.textAlign = 'left';
+                const labelX = p.x + radius + 5 * scale;
+                const labelWidth = ctx.measureText(label).width;
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
+                ctx.fillRect(labelX - 3 * scale, p.y - 9 * scale, labelWidth + 6 * scale, 18 * scale);
+                ctx.fillStyle = '#ffcc00';
+                ctx.fillText(label, labelX, p.y);
+                ctx.restore();
+            }
+        }
+
         function drawFrame(ctx, model, project, ts, width, height, frameStepMs, backgroundCanvas, windowIndex) {
             const scale = Math.max(width, height) / 720;
             ctx.globalAlpha = 1;
@@ -2312,11 +2882,18 @@
                     ctx.fill();
                     ctx.stroke();
                 }
-                ctx.fillStyle = color;
-                ctx.fillRect(18 * scale, legendY - 5 * scale, 12 * scale, 10 * scale);
-                ctx.fillStyle = '#ffffff';
-                ctx.fillText(player, 38 * scale, legendY);
-                legendY += 20 * scale;
+                if (model.overlayOptions.playerNames) {
+                    ctx.fillStyle = color;
+                    ctx.fillRect(18 * scale, legendY - 5 * scale, 12 * scale, 10 * scale);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillText(player, 38 * scale, legendY);
+                    legendY += 20 * scale;
+                }
+            }
+
+            // Shards are exact time-indexed objects and remain above player dots.
+            if (model.overlayOptions.shards) {
+                drawShardMarkers(ctx, model, project, ts, width, height, scale);
             }
 
             ctx.fillStyle = '#ffffff';
@@ -2470,9 +3047,11 @@
                     paletteColors: result.paletteColors,
                     usesMapViewport: result.usesMapViewport,
                     layers: { ...model.layerOptions },
+                    overlays: { ...model.overlayOptions },
                     portalCount: model.backgroundPortals.length,
                     linkCount: model.links.length,
                     snapshotLinkCount: model.links.filter(link => link.fromSnapshot).length,
+                    shardCount: model.shards.length,
                     mapTileCount: model.mapTileCount || 0,
                     mapTileFailures: model.mapTileFailures || 0,
                     timeWindows: model.timeWindows.map(window => ({ ...window })),
@@ -2496,7 +3075,8 @@
             // Kept deliberately small: useful for regression tests without Canvas/IITC.
             _test: {
                 ByteWriter, GifEncoder, makePalette, writeSubblockedLzw,
-                normalizeTimeWindows, buildFrameSchedule, buildLinkLifecycles
+                normalizeTimeWindows, buildFrameSchedule, buildLinkLifecycles,
+                collectModel, drawFrame, drawShardMarkers
             }
         };
     })();
@@ -3277,6 +3857,8 @@
             nowForWindow = events[0]?.ts ?? null;
         }
         if (nowForWindow != null) RENDER.halos.setNow(nowForWindow);
+        RENDER.shards.setFragments(STORE.shards?.fragments || []);
+        if (nowForWindow != null) RENDER.shards.setNow(nowForWindow);
 
         if (RENDER.config.showSegmentsInOverview) {
             RENDER.renderSegmentsWindowedForPlayers([playerName]); // 首帧
@@ -3334,6 +3916,8 @@
             nowForWindow = events[0]?.ts ?? null;
         }
         if (nowForWindow != null) RENDER.halos.setNow(nowForWindow);
+        RENDER.shards.setFragments(STORE.shards?.fragments || []);
+        if (nowForWindow != null) RENDER.shards.setNow(nowForWindow);
 
         console.log(`[trajectory-loader] overview: segments=${segCount}`);
         return segCount;
@@ -3346,6 +3930,7 @@
         RENDER.state.segments = [];
         RENDER.state.activeEvents = [];
         if (RENDER.halos && RENDER.halos.clear) RENDER.halos.clear();
+        RENDER.shards?.setFragments?.([]);
         RENDER.segmentsWindow.clear();
         RENDER.clock.pause();
         RENDER.player?.stop?.();
@@ -3785,11 +4370,12 @@
         snapshotRow.style.marginTop = '10px';
 
         const snapshotLabel = document.createElement('div');
-        snapshotLabel.textContent = 'Link snapshot (optional)';
+        snapshotLabel.textContent = 'Link snapshots (optional)';
         snapshotLabel.style.fontSize = '12px';
 
         const snapshotInput = document.createElement('input');
         snapshotInput.type = 'file';
+        snapshotInput.multiple = true;
         snapshotInput.accept = 'application/json';
         snapshotInput.style.width = '100%';
         snapshotInput.style.maxWidth = '100%';
@@ -3801,14 +4387,19 @@
         snapshotActions.style.flexWrap = 'wrap';
         snapshotActions.style.gap = '6px';
         const btnLoadSnapshot = document.createElement('button');
-        btnLoadSnapshot.textContent = 'Load Snapshot';
+        btnLoadSnapshot.textContent = 'Load Snapshots';
         btnLoadSnapshot.style.height = '28px';
         const btnClearSnapshot = document.createElement('button');
-        btnClearSnapshot.textContent = 'Remove Snapshot';
+        btnClearSnapshot.textContent = 'Remove Snapshots';
         btnClearSnapshot.style.height = '28px';
-        btnClearSnapshot.style.display = STORE.snapshot ? '' : 'none';
+        btnClearSnapshot.style.display = STORE.snapshots.length ? '' : 'none';
+        const btnExportLinkAudit = document.createElement('button');
+        btnExportLinkAudit.textContent = 'Export Link Audit';
+        btnExportLinkAudit.style.height = '28px';
+        btnExportLinkAudit.style.display = STORE.linkLifecycleAudit ? '' : 'none';
         snapshotActions.appendChild(btnLoadSnapshot);
         snapshotActions.appendChild(btnClearSnapshot);
+        snapshotActions.appendChild(btnExportLinkAudit);
 
         const snapshotSummary = document.createElement('div');
         snapshotSummary.style.fontSize = '12px';
@@ -3820,6 +4411,49 @@
         snapshotRow.appendChild(snapshotSummary);
         fileSection.appendChild(snapshotRow);
 
+        const shardRow = document.createElement('div');
+        shardRow.style.display = 'flex';
+        shardRow.style.flexDirection = 'column';
+        shardRow.style.alignItems = 'flex-start';
+        shardRow.style.gap = '6px';
+        shardRow.style.marginTop = '10px';
+
+        const shardLabel = document.createElement('div');
+        shardLabel.textContent = 'Shard history (optional)';
+        shardLabel.style.fontSize = '12px';
+
+        const shardInput = document.createElement('input');
+        shardInput.type = 'file';
+        shardInput.accept = 'application/json';
+        shardInput.style.width = '100%';
+        shardInput.style.maxWidth = '100%';
+        shardInput.style.minWidth = '0';
+        shardInput.style.boxSizing = 'border-box';
+
+        const shardActions = document.createElement('div');
+        shardActions.style.display = 'flex';
+        shardActions.style.flexWrap = 'wrap';
+        shardActions.style.gap = '6px';
+        const btnLoadShards = document.createElement('button');
+        btnLoadShards.textContent = 'Load Shards';
+        btnLoadShards.style.height = '28px';
+        const btnClearShards = document.createElement('button');
+        btnClearShards.textContent = 'Remove Shards';
+        btnClearShards.style.height = '28px';
+        btnClearShards.style.display = STORE.shards ? '' : 'none';
+        shardActions.appendChild(btnLoadShards);
+        shardActions.appendChild(btnClearShards);
+
+        const shardSummary = document.createElement('div');
+        shardSummary.style.fontSize = '12px';
+        shardSummary.style.opacity = '0.9';
+        shardSummary.style.overflowWrap = 'anywhere';
+        shardRow.appendChild(shardLabel);
+        shardRow.appendChild(shardInput);
+        shardRow.appendChild(shardActions);
+        shardRow.appendChild(shardSummary);
+        fileSection.appendChild(shardRow);
+
 
         // ─────────────────────────────────────────────────────────────
         // Section 2: Players & Colors (multi-select + per-player color)
@@ -3827,11 +4461,31 @@
         const playersSection = document.createElement('div');
         playersSection.style.marginTop = '12px';
 
+        const playersHeader = document.createElement('div');
+        playersHeader.style.display = 'flex';
+        playersHeader.style.alignItems = 'center';
+        playersHeader.style.justifyContent = 'space-between';
+        playersHeader.style.gap = '8px';
+        playersHeader.style.marginBottom = '6px';
+
         const playersLabel = document.createElement('div');
         playersLabel.textContent = 'Players';
-        playersLabel.style.marginBottom = '6px';
         playersLabel.style.fontWeight = 'bold';
-        playersSection.appendChild(playersLabel);
+
+        const playerBulkActions = document.createElement('div');
+        playerBulkActions.style.display = 'flex';
+        playerBulkActions.style.gap = '4px';
+        const btnSelectAllPlayers = document.createElement('button');
+        btnSelectAllPlayers.textContent = 'Select all';
+        btnSelectAllPlayers.style.height = '24px';
+        const btnClearPlayers = document.createElement('button');
+        btnClearPlayers.textContent = 'None';
+        btnClearPlayers.style.height = '24px';
+        playerBulkActions.appendChild(btnSelectAllPlayers);
+        playerBulkActions.appendChild(btnClearPlayers);
+        playersHeader.appendChild(playersLabel);
+        playersHeader.appendChild(playerBulkActions);
+        playersSection.appendChild(playersHeader);
 
         // Scrollable list container
         const playersList = document.createElement('div');
@@ -3842,6 +4496,14 @@
         playersList.style.width = '100%';
         playersList.style.boxSizing = 'border-box';
         playersSection.appendChild(playersList);
+
+        function updatePlayerSelectionSummary() {
+            const boxes = Array.from(playersList.querySelectorAll('input[type="checkbox"]'));
+            const selectedCount = boxes.filter(box => box.checked).length;
+            playersLabel.textContent = `Players (${selectedCount}/${boxes.length})`;
+            btnSelectAllPlayers.disabled = boxes.length === 0 || selectedCount === boxes.length;
+            btnClearPlayers.disabled = selectedCount === 0;
+        }
 
         // Utility: build the list from STORE.playerIndex
         function rebuildPlayersList() {
@@ -3875,6 +4537,7 @@
                 cb.addEventListener('change', () => {
                     if (cb.checked) COLORS.addSelected(name);
                     else COLORS.removeSelected(name);
+                    updatePlayerSelectionSummary();
                 });
 
                 const label = document.createElement('span');
@@ -3902,7 +4565,20 @@
                 row.appendChild(color);
                 playersList.appendChild(row);
             }
+            updatePlayerSelectionSummary();
         }
+        btnSelectAllPlayers.onclick = () => {
+            const boxes = Array.from(playersList.querySelectorAll('input[type="checkbox"]'));
+            for (const box of boxes) box.checked = true;
+            COLORS.setSelected(boxes.map(box => box.value));
+            updatePlayerSelectionSummary();
+        };
+        btnClearPlayers.onclick = () => {
+            const boxes = Array.from(playersList.querySelectorAll('input[type="checkbox"]'));
+            for (const box of boxes) box.checked = false;
+            COLORS.setSelected([]);
+            updatePlayerSelectionSummary();
+        };
         rebuildPlayersList();
 
         // Track display options
@@ -3977,35 +4653,52 @@
                 snapshotSummary.textContent = `Snapshot failed: ${error}`;
                 return;
             }
-            const snapshot = STORE.snapshot;
-            btnClearSnapshot.style.display = snapshot ? '' : 'none';
-            if (!snapshot) {
+            const snapshots = STORE.snapshots || [];
+            btnClearSnapshot.style.display = snapshots.length ? '' : 'none';
+            btnExportLinkAudit.style.display = STORE.linkLifecycleAudit ? '' : 'none';
+            if (!snapshots.length) {
                 snapshotSummary.textContent = '';
                 return;
             }
-            const skipped = snapshot.skippedLinks ? ` · ${snapshot.skippedLinks} skipped` : '';
-            const duplicates = snapshot.duplicateLinks ? ` · ${snapshot.duplicateLinks} duplicate endpoints` : '';
-            const merge = snapshot.lastMergeStats;
-            const merged = merge
-                ? ` · ${merge.visible} active snapshot links${merge.conflicts ? ` · ${merge.conflicts} conflicts` : ''}`
-                : '';
-            snapshotSummary.textContent = `${snapshot.name} · ${formatTs(snapshot.capturedAtMs)} · ` +
-                `${snapshot.links.length}/${snapshot.sourceCounts.links} links${skipped}${duplicates}${merged}`;
+            const totalLinks = snapshots.reduce((sum, snapshot) => sum + snapshot.links.length, 0);
+            const sourceLinks = snapshots.reduce((sum, snapshot) => sum + snapshot.sourceCounts.links, 0);
+            const skippedCount = snapshots.reduce((sum, snapshot) => sum + snapshot.skippedLinks, 0);
+            const duplicateCount = snapshots.reduce((sum, snapshot) => sum + snapshot.duplicateLinks, 0);
+            const rejectedCount = snapshots.reduce((sum, snapshot) => sum + (snapshot.lastMergeStats?.rejected || 0), 0);
+            const conflictCount = snapshots.reduce((sum, snapshot) => sum + (snapshot.lastMergeStats?.conflicts || 0), 0);
+            const range = snapshots.length === 1
+                ? formatTs(snapshots[0].capturedAtMs)
+                : `${formatTs(snapshots[0].capturedAtMs)} – ${formatTs(snapshots[snapshots.length - 1].capturedAtMs)}`;
+            const skipped = skippedCount ? ` · ${skippedCount} skipped` : '';
+            const duplicates = duplicateCount ? ` · ${duplicateCount} duplicate endpoints` : '';
+            const rejected = rejectedCount ? ` · ${rejectedCount} crossing links rejected` : '';
+            const conflicts = conflictCount ? ` · ${conflictCount} conflicts` : '';
+            snapshotSummary.textContent = `${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'} · ${range} · ` +
+                `${totalLinks}/${sourceLinks} links${skipped}${duplicates}${rejected}${conflicts}`;
         }
         setSnapshotSummary();
 
         btnLoadSnapshot.onclick = async () => {
-            const file = snapshotInput.files?.[0];
-            if (!file) {
-                setSnapshotSummary('Choose a snapshot JSON file.');
+            const files = Array.from(snapshotInput.files || []);
+            if (!files.length) {
+                setSnapshotSummary('Choose one or more snapshot JSON files.');
                 return;
             }
             btnLoadSnapshot.disabled = true;
-            snapshotSummary.textContent = 'Loading snapshot…';
+            snapshotSummary.textContent = `Loading ${files.length} snapshot${files.length === 1 ? '' : 's'}…`;
             try {
-                await loadSnapshotFile(file);
+                const failures = [];
+                for (const file of files) {
+                    try {
+                        await loadSnapshotFile(file);
+                    } catch (error) {
+                        failures.push(`${file.name}: ${error?.message || error}`);
+                    }
+                }
+                if (failures.length === files.length) throw new Error(failures.join('; '));
                 if (RENDER.state.activeEvents?.length) btnRender.click();
                 setSnapshotSummary();
+                if (failures.length) snapshotSummary.textContent += ` · ${failures.length} failed`;
             } catch (error) {
                 setSnapshotSummary(error?.message || error);
             } finally {
@@ -4018,6 +4711,68 @@
             snapshotInput.value = '';
             if (RENDER.state.activeEvents?.length) btnRender.click();
             setSnapshotSummary();
+        };
+
+        btnExportLinkAudit.onclick = () => {
+            const audit = STORE.linkLifecycleAudit;
+            if (!audit) {
+                snapshotSummary.textContent = 'Render the replay before exporting a Link audit.';
+                return;
+            }
+            const blob = new Blob([JSON.stringify(audit, null, 2)], { type: 'application/json;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
+            anchor.href = url;
+            anchor.download = `iitc-link-audit-${stamp}.json`;
+            anchor.style.display = 'none';
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 30000);
+        };
+
+        function setShardSummary(error = null) {
+            if (error) {
+                shardSummary.textContent = `Shard load failed: ${error}`;
+                return;
+            }
+            const shards = STORE.shards;
+            btnClearShards.style.display = shards ? '' : 'none';
+            if (!shards) {
+                shardSummary.textContent = '';
+                return;
+            }
+            const skipped = shards.skippedHistoryCount ? ` · ${shards.skippedHistoryCount} skipped` : '';
+            shardSummary.textContent = `${shards.name} · ${shards.fragments.length} shards · ` +
+                `${shards.sourceHistoryCount} records · ${formatTs(shards.startTs)} – ${formatTs(shards.endTs)}${skipped}`;
+        }
+        setShardSummary();
+
+        btnLoadShards.onclick = async () => {
+            const file = shardInput.files?.[0];
+            if (!file) {
+                setShardSummary('Choose a shard jump history JSON file.');
+                return;
+            }
+            btnLoadShards.disabled = true;
+            shardSummary.textContent = 'Loading shard history…';
+            try {
+                const shards = await loadShardFile(file);
+                RENDER.shards.setFragments(shards.fragments);
+                RENDER.shards.setNow(RENDER.clock.now);
+                setShardSummary();
+            } catch (error) {
+                setShardSummary(error?.message || error);
+            } finally {
+                btnLoadShards.disabled = false;
+            }
+        };
+
+        btnClearShards.onclick = () => {
+            SHARDS.clear();
+            shardInput.value = '';
+            setShardSummary();
         };
 
         // Wire up inline loader
@@ -4644,6 +5399,8 @@
         const gifGrid = addGifCheckbox('Grid', true);
         const gifPortals = addGifCheckbox('Portals', true);
         const gifScale = addGifCheckbox('Scale', false);
+        const gifPlayerNames = addGifCheckbox('Player names', true);
+        const gifShards = addGifCheckbox('Shards', true);
         gifSection.appendChild(gifOptions);
 
         const gifActions = document.createElement('div');
@@ -4679,7 +5436,10 @@
             btnGif.disabled = true;
             btnGifCancel.disabled = false;
             btnGifCancel.style.display = '';
-            const gifControls = [gifSize, gifFps, gifDuration, gifEndHold, gifMap, gifGrid, gifPortals, gifScale];
+            const gifControls = [
+                gifSize, gifFps, gifDuration, gifEndHold,
+                gifMap, gifGrid, gifPortals, gifScale, gifPlayerNames, gifShards
+            ];
             gifControls.forEach(control => { control.disabled = true; });
             try {
                 const result = await RENDER.gif.export({
@@ -4692,6 +5452,8 @@
                     showGrid: gifGrid.checked,
                     showPortals: gifPortals.checked,
                     showScale: gifScale.checked,
+                    showPlayerNames: gifPlayerNames.checked,
+                    showShards: gifShards.checked,
                     timeWindows: gifWindows.map(window => ({ ...window })),
                     onProgress: progress => {
                         const fraction = Number(progress?.fraction);
@@ -4703,7 +5465,8 @@
                 });
                 const mb = result.byteLength / 1048576;
                 const windowInfo = gifWindows.length ? ` · ${result.timeWindows.length} windows` : '';
-                gifStatus.textContent = `Saved ${result.filename} · ${mb.toFixed(2)} MB · ${result.width}×${result.height} · ${result.frameCount} frames · ${result.endHoldSeconds}s hold${windowInfo}${result.withinTarget ? '' : ' · above 9.5 MB'}`;
+                const shardInfo = result.shardCount ? ` · ${result.shardCount} shards` : '';
+                gifStatus.textContent = `Saved ${result.filename} · ${mb.toFixed(2)} MB · ${result.width}×${result.height} · ${result.frameCount} frames · ${result.endHoldSeconds}s hold${windowInfo}${shardInfo}${result.withinTarget ? '' : ' · above 9.5 MB'}`;
             } catch (error) {
                 gifStatus.textContent = error?.name === 'AbortError'
                     ? 'GIF export cancelled.'
